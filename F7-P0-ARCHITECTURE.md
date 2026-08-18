@@ -931,6 +931,230 @@ The daemon provides inference. It does NOT:
 
 ---
 
+---
+
+## 19. Principal Inheritance (MUST)
+
+### Rule
+
+**Agent MUST inherit Principal from the invoking session. Agent MUST NOT default to admin or elevate privileges.**
+
+The Principal authenticated for the original user request (via AuthProvider.authenticate()) is the same Principal that flows into the agent loop. If no principal exists then deny. No exceptions.
+
+### Why This Matters
+
+Without this rule, it would be tempting to create Principal(id="agent", role="admin") as a convenience shortcut. This would silently elevate the agent to admin regardless of who actually invoked it. A non-admin user would get admin execution behind the scenes.
+
+### Implementation
+
+```python
+class AgentLoop:
+    def __init__(self, *, principal: Principal, ...):
+        self._principal = principal
+
+    def _execute_tool_call(self, ...):
+        result = self._gate.handle_agent_tool_call(
+            principal=self._principal,  # user principal, not agent principal
+            server_id=...,
+            tool_id=...,
+            args=...,
+            request_id=...,
+        )
+```
+
+### Gate.handle_agent_tool_call() Principal is Mandatory
+
+```python
+def handle_agent_tool_call(
+    self,
+    *,
+    principal: Principal,      # REQUIRED, never optional, never defaulted
+    server_id: str,
+    tool_id: str,
+    args: dict,
+    request_id: str,
+) -> McpResult:
+    if principal is None:
+        raise AuthError("agent tool call requires principal")
+```
+
+### Policy Evaluation
+
+```python
+decision = self.policy.evaluate(
+    role=principal.role,      # user role from session
+    command=spec.command_id,
+    capability=spec.capability,
+    resource=resource,
+)
+```
+
+If user role is viewer and viewer lacks WRITE permission then agent also lacks WRITE permission. Agent inherits, never elevates.
+
+### Test Cases
+
+1. Agent invoked by admin principal -> admin permissions
+2. Agent invoked by viewer principal -> viewer permissions (restricted)
+3. Agent invoked with no principal -> denied, no execution
+4. Agent invoked by expired/invalid principal -> denied
+
+---
+
+## 20. Approval Integration and Resumable Agent Execution
+
+### Rule
+
+**Agent tool calls requiring approval MUST integrate with the existing F2 approval state machine. Agent execution MUST be pausable and resumable.**
+
+The agent loop is not fire-and-forget. When the model requests an action that requires human approval, the agent loop must:
+
+1. Persist its state (trajectory, pending tool call)
+2. Create an approval record in F2 state machine (PENDING)
+3. Pause execution
+4. Resume only after approval is granted (APPROVED then CONSUMED)
+5. Continue the model loop from where it left off
+
+### Why This Matters
+
+Without resumable execution, there are two bad options:
+
+- Block the agent loop waiting for approval (hangs if human takes 10 minutes)
+- Skip approval (security violation)
+- Kill the agent and restart after approval (loses context, wastes compute)
+
+Resumable execution means the agent persists, pauses, and resumes cleanly.
+
+### Approval State Machine Integration
+
+F2 approval states: NOT_REQUIRED -> PENDING -> APPROVED -> CONSUMED, or PENDING -> DENIED, or PENDING -> EXPIRED.
+
+Agent tool call flow with approval:
+
+```
+ModelRequest -> tool_call -> Gate.handle_agent_tool_call()
+    -> PolicyEngine.evaluate() -> decision.needs_approval = True
+    -> Create ApprovalRecord with state = PENDING
+    -> Persist AgentState to disk with trajectory and pending_tool_call
+    -> Return McpResult(status="approval_required")
+    -> Agent loop stops (exit code = paused, not error)
+    ... human reviews and approves ...
+    -> AgentState loaded from disk (resume)
+    -> Approval state = CONSUMED
+    -> Gate.execute_approved_tool_call(approval_id)
+    -> Result appended to trajectory
+    -> Agent loop continues (next model iteration)
+```
+
+### Data Structures
+
+```python
+@dataclass
+class AgentState:
+    agent_id: str
+    principal: Principal
+    trajectory: list[TrajectoryEntry]
+    pending_tool_call: PendingToolCall | None = None
+    paused_at: datetime | None = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class PendingToolCall:
+    server_id: str
+    tool_id: str
+    args: dict
+    request_id: str
+    approval_id: str
+```
+
+### Storage
+
+Agent state persisted at /data/vault/agents/{agent_id}/state.json. Written when agent pauses for approval. Read when agent resumes. Deleted after agent completes.
+
+### Timeout
+
+If approval TTL expires while agent is paused: approval state goes to EXPIRED, agent state cleaned up, audit entry with source=agent and result=approval_expired.
+
+### Test Cases
+
+1. Tool call without approval -> continues immediately
+2. Tool call with approval -> pauses, state persisted
+3. Resume after approval -> executes, continues loop
+4. Resume after denial -> model receives denial, continues loop
+5. Resume after expiry -> cleaned up, audit logged
+6. Concurrent agent with pending approval -> state isolation verified
+
+---
+
+## 21. Source=Agent as Provenance-Only
+
+### Rule
+
+**source=agent is a provenance marker ONLY. It is never used for policy evaluation, authorization, or privilege escalation.**
+
+### What Provenance-Only Means
+
+Source answers ONE question: Who or what initiated this action?
+
+| Source    | Meaning                        | Used for Policy? |
+|-----------|--------------------------------|-----------------|
+| interactive | User typed the command directly | NO |
+| background  | Heartbeat daemon initiated      | NO |
+| agent       | Agent loop (model) initiated    | NO |
+
+Source is recorded in: audit log entries, trajectory entries, EventBus events.
+
+Source is NEVER consumed by: PolicyEngine.evaluate(), ApprovalStore, any authorization check.
+
+### Why Source Matters
+
+Even though source is not used for authorization, it is critical for:
+
+1. Audit traceability: When reviewing logs, you need to know if a tool call came from a human, heartbeat, or agent
+2. Forensics: If an agent misbehaves, you can trace its exact trajectory
+3. Debugging: Distinguishing agent-initiated vs human-initiated tool calls in error analysis
+4. Accountability: The requester field in approval records is the human's ID (from Principal), not agent
+
+### Implementation
+
+```python
+audit_log.append(
+    command="filesystem.write_file",
+    capability="WRITE",
+    resource="/data/report.md",
+    role=principal.role,            # used for authorization
+    source="agent",                 # provenance only, NOT used for auth
+    result="allowed",
+    principal_id=principal.id,      # human ID, NOT agent
+)
+```
+
+### What Does NOT Happen
+
+```python
+# WRONG - policy never checks source
+engine.evaluate(..., source="agent")
+
+# WRONG - no policy rule references source
+Rule(role="admin", source="agent", command="filesystem.write_file", allow=True)
+
+# WRONG - agent identity is not stored as principal
+principal = Principal(id="agent", role="admin")
+```
+
+### Relationship to Section 19 (Principal Inheritance)
+
+Section 19 says: agent inherits the user's Principal.
+Section 21 says: source=agent is provenance only.
+
+These are complementary:
+
+- Principal: WHO is authorized (the human user's identity and role)
+- Source: WHAT initiated the action (agent loop, for audit traceability)
+
+Both are recorded in audit entries. Only Principal is used for authorization.
+
+---
+
 ## 18. Decision Gate
 
 ### A. What Changed from Previous F7-P0
