@@ -149,8 +149,8 @@ AgentLoop is NOT implemented in P1. P1 establishes the contract. P2 will impleme
 
 ## I. Commit Hash
 
-- vox-space: TBD (commit pending)
-- GitHub: TBD (push pending)
+- vox-space: a3b5d84
+- GitHub: a3b5d84
 
 ## J. Documentation
 
