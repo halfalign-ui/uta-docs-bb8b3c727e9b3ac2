@@ -141,8 +141,8 @@ Terminal states: COMPLETED, FAILED, CANCELLED (no transitions out).
 
 ## I. Commit Hash
 
-- vox-space: TBD (commit pending)
-- GitHub: TBD (push pending)
+- vox-space: 61d5d5f
+- GitHub: 61d5d5f
 
 ## J. Documentation
 
