@@ -96,7 +96,7 @@ Decision = policy.evaluate(
 )
 ```
 
-**F7 integration**: Model tool calls use role="admin" (same as interactive SSH user). Policy decides based on (role, tool's capability, command). Model identity does not influence the decision.
+**F7 integration**: Model tool calls use the invoking principal's role (e.g. role=principal.role). Policy decides based on (role, tool's capability, command). Model identity does not influence the decision.
 
 ### 3.3 MCP Catalog (F3)
 
@@ -660,7 +660,7 @@ SAFE: Sanitized Result → Model
 | Model output contains injection | Tool results sanitized before model sees them |
 | Provider fails | Loop handles error, returns to user |
 | Tool execution fails | Error captured, loop continues or terminates |
-| Model tries to escalate via identity | Agent role = admin same as interactive, no extra privilege |
+| Model tries to escalate via identity | Agent role=principal.role, same as interactive user, no extra privilege |
 | Model tries to use agent source for privilege | Source="agent" is audit-only, policy uses tool capability |
 
 ---
@@ -672,16 +672,16 @@ SAFE: Sanitized Result → Model
 F6 established:
 - `source = "background"` → audit context, NOT a capability grant
 - `capability = BACKGROUND` → policy evaluates this
-- `role = "admin"` → who is requesting
-- Policy: admin + BACKGROUND on specific tasks = allowed; user = denied
+- `role = principal.role` → who is requesting (the invoking user)
+- Policy: principal.role + BACKGROUND on specific tasks = allowed; other roles = denied
 
 ### F7 Application
 
 F7 follows the same pattern:
 - `source = "agent"` → audit context, NOT a capability grant
 - `capability = ToolSpec.capability` → policy evaluates the TOOL's capability (e.g. READ, WRITE)
-- `role = "admin"` → same role as interactive SSH user
-- Policy: admin + READ on filesystem = allowed; admin + WRITE on vault = denied (no rule)
+- `role = principal.role` → same role as interactive SSH user (principal is inherited, not set by agent)
+- Policy: principal.role + READ on filesystem = allowed; principal.role + WRITE on vault = denied (no rule)
 
 ### Why Agent ≠ Capability
 
@@ -730,12 +730,12 @@ AGENT is a **source** (like "background"), not a **capability**. The tool's own 
 
 - `source = "agent"` in audit entries (like `source = "background"`)
 - `capability = ToolSpec.capability` for policy evaluation (tool's own capability)
-- `role = "admin"` for policy identity (same as interactive user)
+- `role = principal.role` for policy identity (same as interactive user)
 
 ### Proof of No Privilege Escalation
 
 1. Agent tool calls go through `policy.evaluate(role, command, capability, resource)`
-2. `role = "admin"` — same as interactive SSH user
+2. `role = principal.role` — same as interactive SSH user (inherited from invoking principal)
 3. `capability` = tool's capability from CATALOG (e.g. "READ" for filesystem.read_file)
 4. Policy rules are the same rules that govern interactive commands
 5. Agent gets EXACTLY the same permissions as an interactive admin user
@@ -879,7 +879,7 @@ The daemon provides inference. It does NOT:
 - No privilege escalation beyond admin interactive
 - Audit chain integrity after agent operations
 - Source="agent" in audit entries (not granting extra privilege)
-- Agent role identical to interactive admin role
+- Agent role=principal.role, identical to interactive user role
 
 ### 16.4 Existing Test Regression
 
@@ -941,20 +941,29 @@ The daemon provides inference. It does NOT:
 
 The Principal authenticated for the original user request (via AuthProvider.authenticate()) is the same Principal that flows into the agent loop. If no principal exists then deny. No exceptions.
 
+**Agent identity/source never grants privilege.** Agent only inherits authority from the invoking Principal. The string "agent" is not a role, not a capability, and not a credential.
+
 ### Why This Matters
 
 Without this rule, it would be tempting to create Principal(id="agent", role="admin") as a convenience shortcut. This would silently elevate the agent to admin regardless of who actually invoked it. A non-admin user would get admin execution behind the scenes.
+
+The policy engine evaluates `principal.role`. If the invoking principal has role=viewer, the agent has role=viewer. The agent does not get admin because it is an agent. It only gets what the invoking principal has.
 
 ### Implementation
 
 ```python
 class AgentLoop:
     def __init__(self, *, principal: Principal, ...):
+        # principal is REQUIRED, not optional
+        # This is the exact Principal from AuthProvider.authenticate()
+        # Not Principal(id="agent", role="admin")
+        # Not Principal(id="agent", role=principal.role)
+        # Just: the user's own principal, unchanged
         self._principal = principal
 
     def _execute_tool_call(self, ...):
         result = self._gate.handle_agent_tool_call(
-            principal=self._principal,  # user principal, not agent principal
+            principal=self._principal,  # user principal, passed through
             server_id=...,
             tool_id=...,
             args=...,
@@ -976,27 +985,46 @@ def handle_agent_tool_call(
 ) -> McpResult:
     if principal is None:
         raise AuthError("agent tool call requires principal")
+    # principal is the user's Principal from AuthProvider.authenticate()
+    # We do NOT create a new Principal here
+    # We do NOT modify principal.role
 ```
 
 ### Policy Evaluation
 
 ```python
 decision = self.policy.evaluate(
-    role=principal.role,      # user role from session
+    role=principal.role,      # principal.role, NOT role="admin"
     command=spec.command_id,
     capability=spec.capability,
     resource=resource,
 )
 ```
 
-If user role is viewer and viewer lacks WRITE permission then agent also lacks WRITE permission. Agent inherits, never elevates.
+`principal.role` is whatever the invoking user's role is. If invoking user is viewer, agent gets viewer permissions. If invoking user is admin, agent gets admin permissions. The agent does not set or override the role.
+
+### What Does NOT Happen
+
+```python
+# WRONG - agent does not create its own principal
+principal = Principal(id="agent", role="admin")  # WRONG
+
+# WRONG - agent does not escalate role
+principal = Principal(id="agent", role="admin")  # WRONG
+gate.handle_agent_tool_call(principal=principal, ...)
+
+# WRONG - agent does not override role
+principal = Principal(id=original.id, role="admin")  # role changed
+```
 
 ### Test Cases
 
-1. Agent invoked by admin principal -> admin permissions
-2. Agent invoked by viewer principal -> viewer permissions (restricted)
+1. Agent invoked by admin principal -> agent gets admin permissions (because invoking principal IS admin)
+2. Agent invoked by viewer principal -> agent gets viewer permissions (restricted, because invoking principal is viewer)
 3. Agent invoked with no principal -> denied, no execution
 4. Agent invoked by expired/invalid principal -> denied
+5. Agent invoked by admin, model requests vault.write -> denied if no WRITE+vault rule for admin
+6. Agent invoked by viewer, model requests filesystem.write -> denied (viewer lacks WRITE)
 
 ---
 
@@ -1004,48 +1032,70 @@ If user role is viewer and viewer lacks WRITE permission then agent also lacks W
 
 ### Rule
 
-**Agent tool calls requiring approval MUST integrate with the existing F2 approval state machine. Agent execution MUST be pausable and resumable.**
+**Agent tool calls requiring approval MUST use the existing F2 ApprovalStore and state machine. No new approval mechanism. Agent execution MUST be pausable and resumable.**
 
-The agent loop is not fire-and-forget. When the model requests an action that requires human approval, the agent loop must:
+### Existing F2 Infrastructure (Reused As-Is)
 
-1. Persist its state (trajectory, pending tool call)
-2. Create an approval record in F2 state machine (PENDING)
-3. Pause execution
-4. Resume only after approval is granted (APPROVED then CONSUMED)
-5. Continue the model loop from where it left off
+| Component | Location | Used For |
+|-----------|----------|----------|
+| `ApprovalStore.create()` | `approval/store.py` | Creates PENDING approval with binding check |
+| `ApprovalStore.approve()` | `approval/store.py` | Transitions PENDING -> APPROVED |
+| `ApprovalStore.deny()` | `approval/store.py` | Transitions PENDING -> DENIED |
+| `ApprovalStore.consume()` | `approval/store.py` | Transitions APPROVED -> CONSUMED, verifies bound to exact operation |
+| `ApprovalStore.get()` | `approval/store.py` | Retrieves approval by request_id |
+| `Approval` dataclass | `approval/store.py` | Binds to (request_id, command, capability, arg_hash, requester) |
+| `ApprovalState` enum | `approval/state_machine.py` | NOT_REQUIRED, PENDING, APPROVED, DENIED, EXPIRED, CONSUMED |
+| `transition()` | `approval/state_machine.py` | Validates state transitions |
 
-### Why This Matters
+**No new classes, no new methods, no new state machine.** F7 only adds: (1) agent state persistence for resumability, (2) the loop logic that pauses and resumes.
 
-Without resumable execution, there are two bad options:
-
-- Block the agent loop waiting for approval (hangs if human takes 10 minutes)
-- Skip approval (security violation)
-- Kill the agent and restart after approval (loses context, wastes compute)
-
-Resumable execution means the agent persists, pauses, and resumes cleanly.
-
-### Approval State Machine Integration
-
-F2 approval states: NOT_REQUIRED -> PENDING -> APPROVED -> CONSUMED, or PENDING -> DENIED, or PENDING -> EXPIRED.
-
-Agent tool call flow with approval:
+### Agent Tool Call Flow with Approval
 
 ```
-ModelRequest -> tool_call -> Gate.handle_agent_tool_call()
-    -> PolicyEngine.evaluate() -> decision.needs_approval = True
-    -> Create ApprovalRecord with state = PENDING
-    -> Persist AgentState to disk with trajectory and pending_tool_call
-    -> Return McpResult(status="approval_required")
-    -> Agent loop stops (exit code = paused, not error)
-    ... human reviews and approves ...
-    -> AgentState loaded from disk (resume)
-    -> Approval state = CONSUMED
-    -> Gate.execute_approved_tool_call(approval_id)
-    -> Result appended to trajectory
+User message
+    -> AgentLoop.run()
+    -> ModelProvider.complete()
+    -> ModelResponse with tool_call
+    -> Gate.handle_agent_tool_call()
+        -> PolicyEngine.evaluate() -> decision.needs_approval = True
+        -> ApprovalStore.create(         # EXISTING F2 method
+            request_id=request_id,
+            command=spec.command_id,
+            capability=spec.capability,
+            args=args,
+            requester=principal.id,      # user's ID, NOT "agent"
+          )
+        -> Persist AgentState to disk     # NEW: agent-specific, for resumability
+        -> Return McpResult(status="approval_required", data={"approval_id": approval.id})
+    -> Agent loop suspends (not error, not exit)
+    ... human reviews via existing approval mechanism (approve/deny) ...
+    -> AgentState loaded from disk        # NEW: agent-specific, for resumability
+    -> ApprovalStore.get(request_id)      # EXISTING F2 method
+    -> If APPROVED:
+        -> ApprovalStore.consume(         # EXISTING F2 method
+            request_id=request_id,
+            command=spec.command_id,
+            capability=spec.capability,
+            args=args,
+            requester=principal.id,
+          )
+        -> McpClient.call(server_id, tool_id, args)  # same pipeline as interactive
+        -> Result appended to trajectory
     -> Agent loop continues (next model iteration)
 ```
 
-### Data Structures
+### Stable Execution Identity
+
+The `request_id` is the stable identity that connects:
+- The approval record (PENDING) to the tool call to be executed
+- The approval decision (APPROVED/DENIED) back to the exact tool call
+- The consume check (binding: command, capability, arg_hash, requester)
+
+The agent does NOT re-issue or re-create the tool call after approval. The same `request_id` is reused throughout. `ApprovalStore.consume()` verifies the binding matches before executing.
+
+### AgentState Persistence (New in F7)
+
+`AgentState` is new in F7. It is NOT part of the approval mechanism. It is the agent's own state for resumability.
 
 ```python
 @dataclass
@@ -1053,35 +1103,42 @@ class AgentState:
     agent_id: str
     principal: Principal
     trajectory: list[TrajectoryEntry]
-    pending_tool_call: PendingToolCall | None = None
+    pending_request_id: str | None = None   # links to ApprovalStore.get(request_id)
     paused_at: datetime | None = None
     created_at: datetime = field(default_factory=datetime.now)
-
-@dataclass
-class PendingToolCall:
-    server_id: str
-    tool_id: str
-    args: dict
-    request_id: str
-    approval_id: str
 ```
 
-### Storage
+Stored at `/data/vault/agents/{agent_id}/state.json`. Written when agent suspends. Read when agent resumes. Deleted after agent completes.
 
-Agent state persisted at /data/vault/agents/{agent_id}/state.json. Written when agent pauses for approval. Read when agent resumes. Deleted after agent completes.
+The `pending_request_id` is the key to retrieve the approval from `ApprovalStore`. The approval record itself lives in the existing `ApprovalStore` (F2), not in `AgentState`.
+
+### Suspension and Resumption
+
+**Suspension** (agent pauses for approval):
+1. `ApprovalStore.create()` with the tool call's request_id -> PENDING
+2. `AgentState` saved to disk with `pending_request_id = request_id`
+3. Agent loop returns (not error, not exit, status = "suspended")
+
+**Resumption** (after human approves):
+1. `AgentState` loaded from disk
+2. `ApprovalStore.get(pending_request_id)` -> check state
+3. If APPROVED: `ApprovalStore.consume()` with binding check -> execute via MCP
+4. If DENIED: model receives denial in trajectory, continues loop
+5. If EXPIRED: cleanup, audit logged, model receives expiry in trajectory
 
 ### Timeout
 
-If approval TTL expires while agent is paused: approval state goes to EXPIRED, agent state cleaned up, audit entry with source=agent and result=approval_expired.
+If approval TTL expires while agent is suspended: `ApprovalStore` automatically reaps to EXPIRED on next `get()`. Agent state cleaned up. Audit: source=agent, result=approval_expired.
 
 ### Test Cases
 
-1. Tool call without approval -> continues immediately
-2. Tool call with approval -> pauses, state persisted
-3. Resume after approval -> executes, continues loop
-4. Resume after denial -> model receives denial, continues loop
-5. Resume after expiry -> cleaned up, audit logged
-6. Concurrent agent with pending approval -> state isolation verified
+1. Tool call without approval (decision.allowed=True) -> continues immediately, no approval created
+2. Tool call with approval -> `ApprovalStore.create()` returns PENDING, agent suspends, state persisted
+3. Resume after approval -> `ApprovalStore.consume()` succeeds (binding matches), execution through same MCP pipeline
+4. Resume after denial -> model receives denial message in trajectory, continues loop
+5. Resume after expiry -> `ApprovalStore.get()` returns EXPIRED, cleanup, audit logged
+6. Binding mismatch -> `ApprovalStore.consume()` raises InvalidTransition (args changed, capability mismatch)
+7. Concurrent agent with pending approval -> `ApprovalStore` isolation by request_id
 
 ---
 
@@ -1135,10 +1192,10 @@ audit_log.append(
 engine.evaluate(..., source="agent")
 
 # WRONG - no policy rule references source
-Rule(role="admin", source="agent", command="filesystem.write_file", allow=True)
+Rule(role="admin", source="agent", command="filesystem.write_file", allow=True)  # WRONG
 
 # WRONG - agent identity is not stored as principal
-principal = Principal(id="agent", role="admin")
+principal = Principal(id="agent", role="admin")  # WRONG
 ```
 
 ### Relationship to Section 19 (Principal Inheritance)
@@ -1162,7 +1219,7 @@ Both are recorded in audit entries. Only Principal is used for authorization.
 | Area | Previous (Original) | Corrected | Why |
 |------|---------------------|-----------|-----|
 | AGENT capability | Proposed adding `AGENT = "AGENT"` to Capability enum | **Not needed.** Agent is a source, not a capability | F6 shows source/capability distinction; agent uses tool's own capability |
-| Policy rules | Implicit agent-specific rules | No new rules. Agent uses existing MCP tool rules | Agent role=admin gets same permissions as interactive |
+| Policy rules | Implicit agent-specific rules | No new rules. Agent uses existing MCP tool rules | Agent role=principal.role, same permissions as interactive user |
 | Tool schema exposure | Included capability in ToolDefinition | Capability NOT exposed to model | Model doesn't need to know authorization details |
 | Gate integration | Agent calls Gate through same handle_mcp | New `handle_agent_tool_call()` — internal method, no HTTP validation | Agent loop is internal, but still goes through policy/approval/audit |
 | Source convention | Not clearly defined | `source = "agent"` (like `source = "background"`) | Follows F6 precedent for audit traceability |
@@ -1175,7 +1232,7 @@ Both are recorded in audit entries. Only Principal is used for authorization.
 
 2. **Capability not exposed to model**: If the model knows that `filesystem.read_file` has capability="READ", it could reason about capabilities and try to find bypasses. By hiding capability, the model only knows tool name + description + parameters.
 
-3. **Agent source convention**: Source="agent" provides audit traceability without granting privilege. This follows the exact pattern F6 established with source="background".
+3. **Agent source convention**: source="agent" provides audit traceability without granting privilege. This follows the exact pattern F6 established with source="background". Source is never used for authorization.
 
 4. **handle_agent_tool_call()**: Separates the internal agent path from the external HTTP path. Both go through the same policy/approval/audit, but the internal path skips HTTP schema validation (agent loop already validated).
 
@@ -1186,7 +1243,7 @@ Both are recorded in audit entries. Only Principal is used for authorization.
 ### D. How F7 Identifies Agent-Originated Requests Without Extra Privilege
 
 - `source = "agent"` in audit entries (traceability only)
-- `role = "admin"` for policy evaluation (same as interactive)
+- `role = principal.role` for policy evaluation (same as interactive user)
 - `capability = ToolSpec.capability` (tool's own capability)
 - No policy rule references source="agent" (no source-specific rules)
 - Agent gets identical permissions to interactive admin user
@@ -1261,7 +1318,7 @@ F7-P1 deliverables:
 | runtime isolation preserved | ✅ No direct filesystem/shell access for model |
 | no shell preserved | ✅ Agent cannot execute shell commands |
 | no arbitrary execution preserved | ✅ Only CATALOG tools callable |
-| no privilege escalation through agent/model identity | ✅ Agent role=admin = interactive admin, no source-based privilege |
+| | no privilege escalation through agent/model identity | Agent role=principal.role = interactive user, no source-based privilege |
 
 ---
 
