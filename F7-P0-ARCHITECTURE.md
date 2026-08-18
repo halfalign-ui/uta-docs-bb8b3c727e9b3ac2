@@ -240,9 +240,9 @@ Loop (max_iterations):
     Back to model (next iteration)
 ```
 
-### 5.3 Gate Integration — No Parallel Authorization
+### 5.3 Gate Integration -- No Parallel Authorization
 
-The agent loop does NOT bypass Gate. A new internal method on Gate:
+The agent loop does NOT bypass Gate. Two new internal methods on Gate:
 
 ```python
 def handle_agent_tool_call(
@@ -254,11 +254,6 @@ def handle_agent_tool_call(
     args: dict,
     request_id: str,
 ) -> McpResult:
-    """Internal tool-call entry for agent loop.
-    
-    Same pipeline as handle_mcp, without HTTP schema validation.
-    Agent loop already validated the request structure.
-    """
     # 1. Catalog lookup
     spec = tool_lookup(server_id, tool_id)
     if spec is None:
@@ -267,42 +262,117 @@ def handle_agent_tool_call(
     # 2. Scope validation
     resource = self._mcp_validate_scope_for_agent(server_id, tool_id, args, spec)
 
-    # 3. Policy evaluation — uses tool's capability, NOT agent capability
+    # 3. Policy evaluation
     decision = self.policy.evaluate(
         role=principal.role,
         command=spec.command_id,
-        capability=spec.capability,  # <-- tool's capability from CATALOG
+        capability=spec.capability,
         resource=resource,
     )
 
-    # 4. Deny → audit + return error
+    # 4. Denied
     if not decision.allowed:
-        self._audit_mcp_agent(server_id, tool_id, args, decision, "denied", spec)
+        self.audit_log.append({
+            "source": "agent", "request_id": request_id,
+            "command": spec.command_id, "capability": spec.capability,
+            "principal_id": principal.id, "result": "denied",
+        })
         return McpResult(status="error", error_class="denied",
                          data={"error": f"policy denied: {decision.reason}"})
 
-    # 5. Approval required → return approval signal
+    # 5. Approval required -- use existing F2 ApprovalStore
     if decision.needs_approval:
-        return McpResult(status="error", error_class="approval_required",
-                         data={"approval_required": True,
-                               "request_id": request_id,
-                               "command": spec.command_id})
+        approval = self.approval_store.create(
+            request_id=request_id,
+            command=spec.command_id,
+            capability=spec.capability,
+            args=args,
+            requester=principal.id,
+        )
+        self.audit_log.append({
+            "source": "agent", "request_id": request_id,
+            "command": spec.command_id, "capability": spec.capability,
+            "principal_id": principal.id, "result": "approval_requested",
+            "approval_id": approval.id,
+        })
+        return McpResult(status="approval_required",
+                         data={"approval_id": approval.id,
+                               "request_id": request_id})
 
     # 6. Execute via MCP
     try:
         result = self.mcp_client.call(server_id, tool_id, args)
     except Exception as e:
-        self._audit_mcp_agent(server_id, tool_id, args, decision, "error", spec)
+        self.audit_log.append({
+            "source": "agent", "request_id": request_id,
+            "command": spec.command_id, "capability": spec.capability,
+            "principal_id": principal.id, "result": "execution_error",
+        })
         return McpResult(status="error", error_class="mcp_error",
                          data={"error": str(e)})
 
     # 7. Audit success
-    self._audit_mcp_agent(server_id, tool_id, args, decision, "executed", spec,
-                          result_status=result.status)
+    self.audit_log.append({
+        "source": "agent", "request_id": request_id,
+        "command": spec.command_id, "capability": spec.capability,
+        "principal_id": principal.id, "result": "executed",
+    })
+    return result
+
+
+def execute_approved_tool_call(
+    self,
+    *,
+    principal: Principal,
+    request_id: str,
+) -> McpResult:
+    approval = self.approval_store.get(request_id)
+    if approval is None or approval.state != ApprovalState.CONSUMED:
+        raise ValidationError(f"no consumed approval for request_id={request_id}")
+
+    spec = tool_lookup_from_command(approval.command)
+    if spec is None:
+        raise ValidationError(f"unknown tool for command: {approval.command}")
+
+    # Re-validate scope
+    resource = self._mcp_validate_scope_for_agent(
+        spec.server_id, spec.tool_id, approval.arg_hash, spec)
+
+    # Re-evaluate policy (rules may have changed while agent was suspended)
+    decision = self.policy.evaluate(
+        role=principal.role,
+        command=approval.command,
+        capability=approval.capability,
+        resource=resource,
+    )
+    if not decision.allowed:
+        self.audit_log.append({
+            "source": "agent", "request_id": request_id,
+            "result": "denied_on_resume",
+        })
+        return McpResult(status="error", error_class="denied",
+                         data={"error": f"policy denied on resume: {decision.reason}"})
+
+    # Execute via MCP (using stored args from approval)
+    try:
+        result = self.mcp_client.call(spec.server_id, spec.tool_id, approval.args)
+    except Exception as e:
+        self.audit_log.append({
+            "source": "agent", "request_id": request_id,
+            "result": "execution_error",
+        })
+        return McpResult(status="error", error_class="mcp_error",
+                         data={"error": str(e)})
+
+    self.audit_log.append({
+        "source": "agent", "request_id": request_id,
+        "result": "executed",
+    })
     return result
 ```
 
-**Critical**: `capability=spec.capability` — the capability comes from the ToolSpec in CATALOG, NOT from the agent. The agent is never the source of authority.
+**Critical**: `capability=spec.capability` -- the capability comes from the ToolSpec in CATALOG, NOT from the agent. The agent is never the source of authority.
+
 
 ---
 
@@ -1028,119 +1098,494 @@ principal = Principal(id=original.id, role="admin")  # role changed
 
 ---
 
-## 20. Approval Integration and Resumable Agent Execution
+## 20. Approval / Resume Lifecycle
 
-### Rule
+F7 does not create a new approval mechanism. It reuses the existing F2 ApprovalStore and state machine entirely. The only F7 addition is: (1) agent state persistence for resumability, (2) the loop logic that suspends and resumes.
 
-**Agent tool calls requiring approval MUST use the existing F2 ApprovalStore and state machine. No new approval mechanism. Agent execution MUST be pausable and resumable.**
+### 20.1 State Diagram
 
-### Existing F2 Infrastructure (Reused As-Is)
+```
+                    AgentLoop States
+
+  user message --> RUNNING
+                    |
+                    +--> model text response --> COMPLETED
+                    |
+                    +--> model tool_call
+                         |
+                         +--> policy: allowed --> execute --> RUNNING
+                         |
+                         +--> policy: denied --> error to model --> RUNNING
+                         |
+                         +--> policy: needs_approval
+                              |
+                              +--> WAITING_APPROVAL
+                                   |
+                                   +--> approved --> execute --> RUNNING
+                                   |
+                                   +--> denied --> error --> RUNNING
+                                   |
+                                   +--> expired --> cleanup --> RUNNING
+
+  CANCELLED (user abort)
+
+F2 ApprovalStore states (unchanged):
+  NOT_REQUIRED --> PENDING --> APPROVED --> CONSUMED
+                     |            |
+                     +--> DENIED  |
+                     +--> EXPIRED -+
+```
+
+### 20.2 Identity Relationship
+
+F7 does not introduce unnecessary duplicate IDs. The existing F2 identifiers are reused:
+
+```
+session_id                          # Agent session identity (new in F7, for agent state only)
+  +-- request_id                    # F2 Gate request identity (existing)
+       +-- command                  # ToolSpec.command_id (existing)
+       +-- capability               # ToolSpec.capability (existing)
+       +-- arg_hash                 # SHA-256 of sorted args (existing, in Approval)
+       +-- approval_id              # Approval.id (existing, auto-generated UUID)
+```
+
+| Identifier | Created By | Used For |
+|-----------|-----------|----------|
+| session_id | AgentLoop | Agent state persistence, trajectory grouping. New in F7. NOT used for approval. |
+| request_id | AgentLoop / Gate | Stable tool-call identity. Used as ApprovalStore key. Links approval to exact tool call. |
+| approval_id | ApprovalStore.create() | Approval record identity. Used for human-facing approval UI. Retrieved via request_id. |
+| tool_call_id | Model response | Model's tool-call correlation. Mapped to request_id 1:1 by AgentLoop. NOT used for approval. |
+
+**request_id is the stable identity.** It persists from the moment the model produces a tool call, through approval creation, human decision, consume check, and MCP execution. No re-creation, no re-issuance.
+
+approval_id is a secondary identifier derived from request_id via ApprovalStore.get(request_id).id. It is NOT a separate identity -- it is a lookup convenience for the approval UI.
+
+### 20.3 Existing F2 Infrastructure (Reused As-Is)
 
 | Component | Location | Used For |
 |-----------|----------|----------|
-| `ApprovalStore.create()` | `approval/store.py` | Creates PENDING approval with binding check |
-| `ApprovalStore.approve()` | `approval/store.py` | Transitions PENDING -> APPROVED |
-| `ApprovalStore.deny()` | `approval/store.py` | Transitions PENDING -> DENIED |
-| `ApprovalStore.consume()` | `approval/store.py` | Transitions APPROVED -> CONSUMED, verifies bound to exact operation |
-| `ApprovalStore.get()` | `approval/store.py` | Retrieves approval by request_id |
-| `Approval` dataclass | `approval/store.py` | Binds to (request_id, command, capability, arg_hash, requester) |
-| `ApprovalState` enum | `approval/state_machine.py` | NOT_REQUIRED, PENDING, APPROVED, DENIED, EXPIRED, CONSUMED |
-| `transition()` | `approval/state_machine.py` | Validates state transitions |
+| ApprovalStore.create() | approval/store.py | Creates PENDING approval bound to (request_id, command, capability, arg_hash, requester) |
+| ApprovalStore.approve() | approval/store.py | Transitions PENDING -> APPROVED |
+| ApprovalStore.deny() | approval/store.py | Transitions PENDING -> DENIED |
+| ApprovalStore.consume() | approval/store.py | Transitions APPROVED -> CONSUMED. Verifies binding: command, capability, arg_hash, requester. Fails if binding mismatch. |
+| ApprovalStore.get() | approval/store.py | Retrieves approval by request_id. Auto-reaps expired PENDING. |
+| Approval dataclass | approval/store.py | Bound to (request_id, command, capability, arg_hash, requester, expires_at) |
+| ApprovalState | approval/state_machine.py | NOT_REQUIRED, PENDING, APPROVED, DENIED, EXPIRED, CONSUMED |
+| transition() | approval/state_machine.py | Validates state transitions |
 
-**No new classes, no new methods, no new state machine.** F7 only adds: (1) agent state persistence for resumability, (2) the loop logic that pauses and resumes.
+**No new classes, no new methods, no new state machine.**
 
-### Agent Tool Call Flow with Approval
+### 20.4 Pseudocode: handle_agent_tool_call()
 
-```
-User message
-    -> AgentLoop.run()
-    -> ModelProvider.complete()
-    -> ModelResponse with tool_call
-    -> Gate.handle_agent_tool_call()
-        -> PolicyEngine.evaluate() -> decision.needs_approval = True
-        -> ApprovalStore.create(         # EXISTING F2 method
-            request_id=request_id,
-            command=spec.command_id,
-            capability=spec.capability,
-            args=args,
-            requester=principal.id,      # user's ID, NOT "agent"
-          )
-        -> Persist AgentState to disk     # NEW: agent-specific, for resumability
-        -> Return McpResult(status="approval_required", data={"approval_id": approval.id})
-    -> Agent loop suspends (not error, not exit)
-    ... human reviews via existing approval mechanism (approve/deny) ...
-    -> AgentState loaded from disk        # NEW: agent-specific, for resumability
-    -> ApprovalStore.get(request_id)      # EXISTING F2 method
-    -> If APPROVED:
-        -> ApprovalStore.consume(         # EXISTING F2 method
+```python
+def handle_agent_tool_call(
+    self,
+    *,
+    principal: Principal,
+    server_id: str,
+    tool_id: str,
+    args: dict,
+    request_id: str,
+) -> McpResult:
+    # 1. Catalog lookup
+    spec = tool_lookup(server_id, tool_id)
+    if spec is None:
+        raise ValidationError(f"unknown tool: {server_id}.{tool_id}")
+
+    # 2. Scope validation
+    resource = self._mcp_validate_scope_for_agent(server_id, tool_id, args, spec)
+
+    # 3. Policy evaluation
+    decision = self.policy.evaluate(
+        role=principal.role,
+        command=spec.command_id,
+        capability=spec.capability,
+        resource=resource,
+    )
+
+    # 4. Denied
+    if not decision.allowed:
+        self.audit_log.append({
+            "source": "agent",
+            "request_id": request_id,
+            "command": spec.command_id,
+            "capability": spec.capability,
+            "principal_id": principal.id,
+            "result": "denied",
+        })
+        return McpResult(status="error", error_class="denied",
+                         data={"error": f"policy denied: {decision.reason}"})
+
+    # 5. Approval required -- use existing F2 ApprovalStore
+    if decision.needs_approval:
+        approval = self.approval_store.create(
             request_id=request_id,
             command=spec.command_id,
             capability=spec.capability,
             args=args,
             requester=principal.id,
-          )
-        -> McpClient.call(server_id, tool_id, args)  # same pipeline as interactive
-        -> Result appended to trajectory
-    -> Agent loop continues (next model iteration)
+        )
+        self.audit_log.append({
+            "source": "agent",
+            "request_id": request_id,
+            "command": spec.command_id,
+            "capability": spec.capability,
+            "principal_id": principal.id,
+            "result": "approval_requested",
+            "approval_id": approval.id,
+        })
+        return McpResult(
+            status="approval_required",
+            data={
+                "approval_id": approval.id,
+                "request_id": request_id,
+                "command": spec.command_id,
+            },
+        )
+
+    # 6. Execute via MCP
+    try:
+        result = self.mcp_client.call(server_id, tool_id, args)
+    except Exception as e:
+        self.audit_log.append({
+            "source": "agent",
+            "request_id": request_id,
+            "command": spec.command_id,
+            "capability": spec.capability,
+            "principal_id": principal.id,
+            "result": "execution_error",
+        })
+        return McpResult(status="error", error_class="mcp_error",
+                         data={"error": str(e)})
+
+    # 7. Audit success
+    self.audit_log.append({
+        "source": "agent",
+        "request_id": request_id,
+        "command": spec.command_id,
+        "capability": spec.capability,
+        "principal_id": principal.id,
+        "result": "executed",
+    })
+    return result
 ```
 
-### Stable Execution Identity
-
-The `request_id` is the stable identity that connects:
-- The approval record (PENDING) to the tool call to be executed
-- The approval decision (APPROVED/DENIED) back to the exact tool call
-- The consume check (binding: command, capability, arg_hash, requester)
-
-The agent does NOT re-issue or re-create the tool call after approval. The same `request_id` is reused throughout. `ApprovalStore.consume()` verifies the binding matches before executing.
-
-### AgentState Persistence (New in F7)
-
-`AgentState` is new in F7. It is NOT part of the approval mechanism. It is the agent's own state for resumability.
+### 20.5 Pseudocode: AgentLoop -- Suspension and Resumption
 
 ```python
-@dataclass
-class AgentState:
-    agent_id: str
-    principal: Principal
-    trajectory: list[TrajectoryEntry]
-    pending_request_id: str | None = None   # links to ApprovalStore.get(request_id)
-    paused_at: datetime | None = None
-    created_at: datetime = field(default_factory=datetime.now)
+class AgentLoop:
+    def __init__(
+        self,
+        *,
+        principal: Principal,
+        session_id: str,
+        gate: Gate,
+        provider: ModelProvider,
+        approval_store: ApprovalStore,
+        audit_log: AuditLog,
+        max_iterations: int = 50,
+    ):
+        self._principal = principal
+        self._session_id = session_id
+        self._gate = gate
+        self._provider = provider
+        self._approval_store = approval_store
+        self._audit_log = audit_log
+        self._max_iterations = max_iterations
+        self._trajectory = []
+        self._state = AgentState.RUNNING
+
+    def run(self, user_message: str) -> AgentResult:
+        if user_message:
+            self._trajectory.append(TrajectoryEntry(role="user", content=user_message))
+
+        for _ in range(self._max_iterations):
+            response = self._provider.complete(self._build_request())
+
+            if response.text and not response.tool_calls:
+                self._trajectory.append(TrajectoryEntry(role="assistant", content=response.text))
+                self._state = AgentState.COMPLETED
+                return AgentResult(state=self._state, trajectory=self._trajectory)
+
+            if response.tool_calls:
+                for tool_call in response.tool_calls:
+                    result = self._execute_tool_call(tool_call)
+
+                    if result.status == "approval_required":
+                        self._state = AgentState.WAITING_APPROVAL
+                        self._persist_state(pending_request_id=tool_call.request_id)
+                        return AgentResult(
+                            state=self._state,
+                            trajectory=self._trajectory,
+                            pending_request_id=tool_call.request_id,
+                        )
+
+                    self._trajectory.append(
+                        TrajectoryEntry(role="tool", tool_call_id=tool_call.id, content=result.data)
+                    )
+
+        self._state = AgentState.FAILED
+        return AgentResult(state=self._state, trajectory=self._trajectory)
+
+    def _execute_tool_call(self, tool_call: ToolCall) -> McpResult:
+        self._validate_tool_call(tool_call)
+        return self._gate.handle_agent_tool_call(
+            principal=self._principal,
+            server_id=tool_call.server_id,
+            tool_id=tool_call.tool_id,
+            args=tool_call.args,
+            request_id=tool_call.request_id,
+        )
+
+    def resume(self) -> AgentResult:
+        state = self._load_state()
+        request_id = state["pending_request_id"]
+        approval = self._approval_store.get(request_id)
+
+        if approval is None:
+            raise RuntimeError(f"no approval found for request_id={request_id}")
+
+        if approval.state == ApprovalState.APPROVED:
+            self._approval_store.consume(
+                request_id=request_id,
+                command=approval.command,
+                capability=approval.capability,
+                args=approval.args,
+                requester=approval.requester,
+            )
+            result = self._gate.execute_approved_tool_call(
+                principal=self._principal,
+                request_id=request_id,
+            )
+            self._trajectory.append(
+                TrajectoryEntry(role="tool", tool_call_id=request_id, content=result.data)
+            )
+            self._state = AgentState.RUNNING
+            self._clear_pending_state()
+            return self.run("")
+
+        if approval.state == ApprovalState.DENIED:
+            self._trajectory.append(
+                TrajectoryEntry(role="tool", tool_call_id=request_id,
+                                content={"denied": True, "reason": "approval denied by user"})
+            )
+            self._state = AgentState.RUNNING
+            self._clear_pending_state()
+            return self.run("")
+
+        if approval.state == ApprovalState.EXPIRED:
+            self._audit_log.append({
+                "source": "agent", "request_id": request_id,
+                "result": "approval_expired", "principal_id": self._principal.id,
+            })
+            self._trajectory.append(
+                TrajectoryEntry(role="tool", tool_call_id=request_id,
+                                content={"expired": True, "reason": "approval TTL expired"})
+            )
+            self._state = AgentState.RUNNING
+            self._clear_pending_state()
+            return self.run("")
+
+        raise RuntimeError(f"unexpected approval state: {approval.state}")
 ```
 
-Stored at `/data/vault/agents/{agent_id}/state.json`. Written when agent suspends. Read when agent resumes. Deleted after agent completes.
+### 20.6 Resume Security -- Binding Invariants
 
-The `pending_request_id` is the key to retrieve the approval from `ApprovalStore`. The approval record itself lives in the existing `ApprovalStore` (F2), not in `AgentState`.
+On resume, ApprovalStore.consume() verifies ALL of the following. If ANY fails, execution is rejected.
 
-### Suspension and Resumption
+```python
+# Inside ApprovalStore.consume():
+binds = (
+    a.command == command
+    and a.capability == capability
+    and a.arg_hash == arg_hash(args)
+    and a.requester == requester
+)
+```
 
-**Suspension** (agent pauses for approval):
-1. `ApprovalStore.create()` with the tool call's request_id -> PENDING
-2. `AgentState` saved to disk with `pending_request_id = request_id`
-3. Agent loop returns (not error, not exit, status = "suspended")
+| Binding Field | What It Prevents |
+|---------------|-----------------|
+| command | Approved filesystem.read executed as filesystem.write |
+| capability | Approved READ executed with WRITE capability |
+| arg_hash | Approved path=/tmp/a executed with path=/etc/shadow |
+| requester | User A approval used for User B execution |
 
-**Resumption** (after human approves):
-1. `AgentState` loaded from disk
-2. `ApprovalStore.get(pending_request_id)` -> check state
-3. If APPROVED: `ApprovalStore.consume()` with binding check -> execute via MCP
-4. If DENIED: model receives denial in trajectory, continues loop
-5. If EXPIRED: cleanup, audit logged, model receives expiry in trajectory
+**If arguments change after approval:** New args produce different arg_hash. consume() raises InvalidTransition. Agent must re-request approval with new request_id.
 
-### Timeout
+**If the approval is denied or expired:** consume() raises InvalidTransition (state is not APPROVED). Execution is rejected.
 
-If approval TTL expires while agent is suspended: `ApprovalStore` automatically reaps to EXPIRED on next `get()`. Agent state cleaned up. Audit: source=agent, result=approval_expired.
+**If the tool/server changes:** Different command value. consume() raises InvalidTransition.
 
-### Test Cases
+**The approval is NOT transferable.** It is bound to exactly one tool call with exactly one set of arguments for exactly one principal.
 
-1. Tool call without approval (decision.allowed=True) -> continues immediately, no approval created
-2. Tool call with approval -> `ApprovalStore.create()` returns PENDING, agent suspends, state persisted
-3. Resume after approval -> `ApprovalStore.consume()` succeeds (binding matches), execution through same MCP pipeline
-4. Resume after denial -> model receives denial message in trajectory, continues loop
-5. Resume after expiry -> `ApprovalStore.get()` returns EXPIRED, cleanup, audit logged
-6. Binding mismatch -> `ApprovalStore.consume()` raises InvalidTransition (args changed, capability mismatch)
-7. Concurrent agent with pending approval -> `ApprovalStore` isolation by request_id
+### 20.7 Resume Security -- Additional Invariants
 
----
+Beyond the ApprovalStore binding check, the resume path also verifies:
+
+1. **Same Principal** -- AgentState.principal_id must match the current principal. If principal changed (e.g., session expired), resume is rejected.
+2. **Same session** -- AgentState.session_id must match. Agent state cannot be loaded by a different session.
+3. **Scope re-validation** -- Gate.execute_approved_tool_call() re-validates scope via _mcp_validate_scope_for_agent(). If the tool's server or scope has changed, execution is rejected.
+4. **Policy re-evaluation** -- Gate.execute_approved_tool_call() re-evaluates policy. If rules changed while agent was suspended, execution follows the new policy.
+
+### 20.8 AgentState -- Minimal Paused State
+
+```python
+class AgentState(str, Enum):
+    RUNNING = "RUNNING"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+@dataclass
+class PersistedAgentState:
+    session_id: str
+    principal_id: str
+    principal_role: str
+    trajectory: list[dict]
+    pending_request_id: str | None
+    paused_at: float | None
+    created_at: float
+```
+
+Stored at `/data/vault/agents/{session_id}/state.json`. Written when agent suspends (WAITING_APPROVAL). Read when agent resumes. Deleted after agent completes or fails.
+
+**The pending_request_id is the only link to the approval.** The approval record itself lives in ApprovalStore (F2), not in AgentState. AgentState does not duplicate approval data.
+
+### 20.9 Approval Resume Flow -- Complete Sequence
+
+```
+AgentLoop.run(user_message)
+    |
+    v
+ModelProvider.complete(request)
+    |
+    v
+ModelResponse(tool_calls=[ToolCall(...)])
+    |
+    v
+AgentLoop._execute_tool_call(tool_call)
+    |
+    +-- F7 validates ToolCall structure
+    |
+    v
+Gate.handle_agent_tool_call(principal, server_id, tool_id, args, request_id)
+    |
+    +-- Catalog lookup -> ToolSpec
+    +-- Scope validation
+    +-- PolicyEngine.evaluate(role=principal.role, command, capability, resource)
+    |
+    v
+Decision.needs_approval == True
+    |
+    +-- ApprovalStore.create(              <-- F2, existing
+    |      request_id=request_id,
+    |      command=spec.command_id,
+    |      capability=spec.capability,
+    |      args=args,
+    |      requester=principal.id,
+    |   ) -> Approval(id=approval_id, state=PENDING)
+    |
+    +-- AuditLog.append({                  <-- F2, existing
+    |      source="agent",
+    |      result="approval_requested",
+    |      ...
+    |   })
+    |
+    +-- AgentLoop._persist_state(          <-- F7, new
+    |      pending_request_id=request_id,
+    |   ) -> /data/vault/agents/{session_id}/state.json
+    |
+    +-- AgentLoop._state = WAITING_APPROVAL
+    |
+    v
+AgentLoop returns AgentResult(state=WAITING_APPROVAL)
+    |
+    |  ... time passes, user reviews ...
+    |
+    v
+User approves via existing approval mechanism:
+    ApprovalStore.approve(request_id, approved_by=user_id)
+    |
+    v
+AgentLoop.resume()                        <-- F7, new
+    |
+    +-- Load AgentState from disk
+    +-- ApprovalStore.get(pending_request_id)  <-- F2, existing
+    |
+    v
+approval.state == APPROVED
+    |
+    +-- ApprovalStore.consume(             <-- F2, existing
+    |      request_id=request_id,
+    |      command=approval.command,
+    |      capability=approval.capability,
+    |      args=approval.args,
+    |      requester=approval.requester,
+    |   )
+    |   -> Binding check: command, capability, arg_hash, requester
+    |   -> If mismatch -> InvalidTransition, execution rejected
+    |   -> If ok -> state = CONSUMED
+    |
+    +-- Gate.execute_approved_tool_call(   <-- F7, new (thin wrapper)
+    |      principal=principal,
+    |      request_id=request_id,
+    |   )
+    |   -> Scope re-validation
+    |   -> Policy re-evaluation
+    |   -> McpClient.call(server_id, tool_id, args)
+    |
+    +-- AuditLog.append({                  <-- F2, existing
+    |      source="agent",
+    |      result="executed",
+    |      ...
+    |   })
+    |
+    +-- TrajectoryEntry(role="tool", content=result)
+    |
+    +-- AgentLoop._clear_pending_state()   <-- F7, new
+    |   -> Remove /data/vault/agents/{session_id}/state.json
+    |
+    +-- AgentLoop._state = RUNNING
+    |
+    v
+AgentLoop.run("") -> continues with existing trajectory
+    |
+    v
+ModelProvider.complete(trajectory) -> next iteration
+```
+
+### 20.10 Audit Events -- Approval Lifecycle
+
+All audit entries use the existing F2 AuditLog (hash-chain). No parallel log.
+
+| Event | source | result | approval_id | When |
+|-------|--------|--------|-------------|------|
+| tool requested | agent | allowed | -- | Policy allowed, no approval needed |
+| tool requested | agent | denied | -- | Policy denied |
+| approval requested | agent | approval_requested | yes | Policy needs approval, ApprovalStore.create() |
+| approval approved | -- | approval_approved | yes | User approved (via existing approval mechanism) |
+| approval denied | -- | approval_denied | yes | User denied |
+| approval expired | agent | approval_expired | yes | TTL expired while waiting |
+| tool executed | agent | executed | -- | Successful MCP execution |
+| tool execution failed | agent | execution_error | -- | MCP execution error |
+
+All entries include: source="agent", command=spec.command_id, capability=spec.capability, principal_id=principal.id, role=principal.role.
+
+**Never:** capability="AGENT" or source=anything_else.
+
+### 20.11 Failure / Expiry / Cancellation
+
+| Scenario | Behavior |
+|----------|----------|
+| Approval denied | AgentState cleared. Model receives denial in trajectory. Agent loop continues. |
+| Approval expired | ApprovalStore.get() auto-reaps to EXPIRED. Agent state cleaned. Audit logged. Model receives expiry in trajectory. Agent loop continues. |
+| Arguments changed after approval | ApprovalStore.consume() raises InvalidTransition (arg_hash mismatch). Agent must create new request_id and re-request approval. |
+| Principal changed/expired | Resume rejected. Agent state cleaned. Audit logged. |
+| Agent cancelled by user | AgentState set to CANCELLED. Pending approval remains PENDING (cleaned by existing TTL). Audit logged. |
+| Max iterations reached | AgentState set to FAILED. Any pending approval cleaned. Audit logged. |
+| Provider error | AgentState set to FAILED. Error in trajectory. |
+
 
 ## 21. Source=Agent as Provenance-Only
 
