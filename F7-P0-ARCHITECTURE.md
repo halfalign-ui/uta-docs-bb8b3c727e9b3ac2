@@ -1,9 +1,9 @@
 # F7-P0 — Local Intelligence Runtime: Architecture & Preflight Report
 
-> Status: PREFLIGHT / DESIGN
+> Status: CORRECTED PREFLIGHT / DESIGN
 > Date: 2026-08-18
-> Baseline: F6 (304 tests, commit `04dbb59`)
-> Author: opencode session
+> Baseline: F6 CONFIRMED CLOSED (304 tests, commit `04dbb59`)
+> Previous: F7-P0 original (superseded by this correction)
 
 ---
 
@@ -20,52 +20,86 @@
 |------|---------|--------------|
 | `core.py` | Gate orchestrator: auth → schema → policy → approval → execute → audit | **Primary integration point** |
 | `policy/engine.py` | Deny-by-default policy evaluation | Model requests pass through here |
-| `policy/classes.py` | Capability enum: READ, WRITE, EXECUTE, SECRET, NETWORK, BACKGROUND | Needs AGENT capability |
+| `policy/classes.py` | Capability enum: READ, WRITE, EXECUTE, SECRET, NETWORK, BACKGROUND | See Section 13 for AGENT decision |
 | `mcp/catalog.py` | Tool catalog: ToolSpec(server_id, tool_id, capability, scope_kind) | Model queries this for available tools |
 | `mcp/client.py` | MCP tool execution with timeout, result limits | Agent loop calls this for tool results |
-| `ingress/schemas.py` | Request validation: CommandRequest, McpRequest, ApproveRequest | Agent loop uses McpRequest format |
+| `ingress/schemas.py` | Request validation: CommandRequest, McpRequest, ApproveRequest | Source list needs "agent" added |
 | `events.py` | EventBus for SSE streaming | Agent loop publishes trajectory events |
 | `audit/audit.py` | Hash-chain append-only audit log | Agent actions logged here |
 | `approval/store.py` | Approval state machine | Write operations require approval |
-| `cloud/runtime.py` | Cloud execution: CloudRuntime.execute() | F7 does NOT replace this; F7 uses model providers differently |
-| `cloud/provider.py` | ProviderConfig, ModelSpec, PricingInfo | Reusable abstraction pattern for local providers |
-| `cloud/config.py` | CloudConfig, QuotaLimits | Pattern for local model config |
 | `factory.py` | build_gate() — single construction point | F7 provider wiring goes here |
 | `config.py` | Config dataclass, env loading | F7 config fields added here |
 
 ---
 
-## 2. F2–F6 Integration Points
+## 2. F6 Baseline Verification
 
-### 2.1 Gate Core Pipeline (F2)
+F6 is the authoritative baseline for F7. Verified:
+
+- **304/304 tests PASS**, 0 regression
+- Commits: `686f8b1`, `d388ff5`
+- systemd timer active: `uta-heartbeat.timer` (5-min interval)
+- All 4 heartbeat tasks verified working
+- `source=background` audit entries confirmed in audit log
+- Hash chain integrity: OK
+- No secrets in audit log: VERIFIED
+- F2/F3/F4/F5A security boundaries: ALL INTACT
+
+### F6 Source/Context Pattern (Authoritative for F7)
+
+F6 establishes the distinction between **source/context** and **capability**:
+
+| Aspect | F6 Example | Role |
+|--------|-----------|------|
+| **Source** | `"background"` | Execution context — WHO/WHAT initiated the action |
+| **Capability** | `BACKGROUND` | Authorization token — WHAT the policy evaluates |
+| **Command** | `"background.health_check"` | Specific operation name |
+| **Role** | `"admin"` | Policy identity — WHO is requesting |
+
+Key invariants from F6:
+- **"Heartbeat privilege = interactive, never more"**
+- **"Heartbeat does not bypass policy/approval"**
+- BACKGROUND capability is granted only to admin role on specific hardcoded tasks
+- User role gets NO BACKGROUND rules → denied by default
+- Audit entries record source=background for traceability
+
+**F7 MUST follow this same pattern.** The agent is a source/context. It does not gain authority from being an agent.
+
+---
+
+## 3. F2–F6 Integration Points
+
+### 3.1 Gate Core Pipeline (F2)
+
 ```
 handle_mcp(principal, body):
   1. validate_mcp_request(body)     → McpRequest
   2. tool_lookup(server_id, tool_id) → ToolSpec
-  3. _mcp_validate_scope(req, spec)  → resource (canonical path/label)
+  3. _mcp_validate_scope(req, spec)  → resource
   4. policy.evaluate(role, cmd, cap, resource) → Decision
   5. if needs_approval → _mcp_approval_flow()
   6. mcp_client.call(server_id, tool_id, args) → McpResult
   7. audit.append(...)
-  8. return 200, {result}
+  8. return result
 ```
 
-**F7 integration**: The agent loop's tool calls enter at step 1. F7 wraps the model's structured output into an McpRequest-compatible format and feeds it through the existing pipeline.
+**F7 integration**: Agent tool calls enter at step 1. F7 wraps model output into McpRequest-compatible format and feeds through existing pipeline. Agent does NOT bypass any step.
 
-### 2.2 Policy Engine (F2)
+### 3.2 Policy Engine (F2)
+
 ```python
 Decision = policy.evaluate(
-    role="admin",           # or "user"
+    role="admin",
     command="filesystem.read_file",
     capability="READ",
     resource="/data/some/path",
 )
-# Decision(allowed=True/False, needs_approval=True/False, reason="...")
 ```
 
-**F7 integration**: Model tool-call requests use role="admin" (local model = same privilege as interactive SSH). Policy decides whether the tool call is permitted. Model cannot override this.
+**F7 integration**: Model tool calls use role="admin" (same as interactive SSH user). Policy decides based on (role, tool's capability, command). Model identity does not influence the decision.
 
-### 2.3 MCP Catalog (F3)
+### 3.3 MCP Catalog (F3)
+
 ```python
 CATALOG = {
     ("filesystem", "read_file"): ToolSpec(
@@ -76,118 +110,72 @@ CATALOG = {
 }
 ```
 
-**F7 integration**: The agent runtime builds the model's tool schema from CATALOG. Model sees available tools + their argument schemas. Model can only call tools that exist in CATALOG.
+**F7 integration**: Agent runtime builds model's tool schema from CATALOG. Each tool carries its own capability. Model sees available tools but F2 determines if each is permitted.
 
-### 2.4 MCP Client (F3)
+### 3.4 MCP Client (F3)
+
 ```python
 result = mcp_client.call("filesystem", "read_file", {"path": "/data/file.txt"})
 # McpResult(status="ok", data={...}, duration_ms=123.4)
 ```
 
-**F7 integration**: Agent loop calls this to execute tool calls. Results are fed back to the model as tool results in the trajectory.
+**F7 integration**: Agent loop calls this after policy allows. Results fed back to model as tool results in trajectory.
 
-### 2.5 Audit (F2)
+### 3.5 Audit (F2)
+
 ```python
 audit.append({
-    "source": "agent",       # or "dev", "cloud-l2", "worker", "background"
+    "source": "agent",        # execution context
     "request_id": "req_...",
     "command": "filesystem.read_file",
-    "capability": "READ",
+    "capability": "READ",     # tool's capability, not agent capability
     "decision": "allowed",
-    "result_status": "ok",
     ...
 })
 ```
 
-**F7 integration**: Agent loop logs every tool call. Source = "agent". Trajectory entries are auditable.
+**F7 integration**: Agent loop logs every tool call. Source="agent" for traceability. Tool's own capability recorded.
 
-### 2.6 EventBus (F2)
+### 3.6 EventBus (F2)
+
 ```python
-events.publish({"type": "agent_turn", "request_id": "...", "tool_calls": [...]})
+events.publish({"type": "agent_tool_call", "request_id": "...", "tool": "filesystem.read_file"})
 ```
 
-**F7 integration**: Agent loop publishes events for SSE streaming. UI can observe agent thinking, tool calls, results in real-time.
+**F7 integration**: Agent publishes trajectory events for SSE streaming.
 
-### 2.7 Approval Gate (F2)
+### 3.7 Approval Gate (F2)
+
 ```python
 if decision.needs_approval:
-    # Create approval, wait for user confirmation
     return approval_flow(...)
 ```
 
-**F7 integration**: If model requests a write operation, approval gate activates. Agent loop pauses, waits for approval, then continues. Model cannot skip approval.
+**F7 integration**: Model write requests go through approval. Agent loop pauses, waits for user confirmation. Model cannot skip approval.
 
 ---
 
-## 3. Existing Reusable Abstractions
+## 4. Existing Reusable Abstractions
 
 | Abstraction | Location | F7 Usage |
 |-------------|----------|----------|
-| `Capability` enum | `policy/classes.py` | Extend with AGENT |
-| `ToolSpec` | `mcp/catalog.py` | Model tool schema source |
+| `Capability` enum | `policy/classes.py` | **No new capability needed** (see Section 13) |
+| `ToolSpec` | `mcp/catalog.py` | Model tool schema source — each tool has its own capability |
 | `Decision` | `policy/engine.py` | Tool-call authorization |
 | `McpResult` | `mcp/client.py` | Tool execution result |
 | `McpRequest` | `ingress/schemas.py` | Tool-call request format |
 | `EventBus` | `events.py` | Agent trajectory events |
 | `AuditLog` | `audit/audit.py` | Agent action audit |
-| `ProviderConfig` | `cloud/provider.py` | Pattern for local model config |
-| `ModelSpec` | `cloud/provider.py` | Pattern for model capability metadata |
-| `CloudConfig` | `cloud/config.py` | Pattern for local model config |
 | `ApprovalStore` | `approval/store.py` | Write-operation approval |
-
----
-
-## 4. Conflicts / Gaps
-
-### 4.1 Capability Enum Gap
-Current capabilities: READ, WRITE, EXECUTE, SECRET, NETWORK, BACKGROUND
-
-**Gap**: No AGENT or MODEL_CAPABILITY for agent loop operations. The agent loop itself is not a "tool" — it's an orchestration layer. But tool calls from the agent need a capability marker.
-
-**Resolution**: Add `AGENT = "AGENT"` to Capability. Agent tool calls use AGENT as the capability. Policy rules for AGENT = same as current admin rules for tool-specific capabilities. The agent doesn't get special powers — it uses the same tool permissions as an interactive user.
-
-### 4.2 Gate Entry Point Gap
-Current `handle_mcp()` is designed for external HTTP requests (validates schema, checks source, etc.)
-
-**Gap**: Agent loop calls are internal, not HTTP requests. The agent loop shouldn't need to construct full HTTP request bodies.
-
-**Resolution**: Add `Gate.handle_agent_tool_call()` — internal method that:
-- Takes a structured tool call (server_id, tool_id, args)
-- Bypasses HTTP schema validation (agent loop already validated)
-- Still goes through policy → approval → MCP → audit
-- Returns McpResult directly
-
-### 4.3 Tool Schema for Model
-Model needs to know what tools are available and their argument schemas.
-
-**Gap**: CATALOG has ToolSpec but no JSON Schema for arguments.
-
-**Resolution**: Add `argument_schema: dict` to ToolSpec (or a separate schema registry). Each MCP server already defines its tools via MCP protocol — we can extract schemas from there, or define them statically per tool.
-
-### 4.4 Trajectory State
-Model needs conversation history (messages, tool calls, tool results).
-
-**Gap**: No session/trajectory abstraction exists.
-
-**Resolution**: Create `Session` class (see architecture below).
-
-### 4.5 Agent Loop
-No multi-turn inference loop exists.
-
-**Resolution**: Create `AgentLoop` class (see architecture below).
-
-### 4.6 Provider Abstraction
-Cloud uses `CloudExecutor` which is OpenAI-compatible. Local model would use different runtime (llama-cpp, ONNX, etc.)
-
-**Gap**: No generic provider abstraction.
-
-**Resolution**: Create `ModelProvider` protocol and `ModelRequest`/`ModelResponse` dataclasses.
+| `build_mcp_rules()` | `policy/engine.py` | Policy rules for MCP tools |
+| `_SOURCES` | `ingress/schemas.py` | Needs "agent" added (like F6 added "background") |
 
 ---
 
 ## 5. Proposed F7 Architecture
 
 ### 5.1 New Module Structure
+
 ```
 gate/gate/
 ├── agent/                    # NEW — F7
@@ -199,181 +187,108 @@ gate/gate/
 │   │   └── local.py          # LocalModelProvider (llama-cpp/ONNX wrapper)
 │   ├── session.py            # Session, Trajectory, AgentState
 │   ├── loop.py               # AgentLoop — multi-turn inference
-│   ├── tool_call.py          # Tool-call parsing, validation, schema
+│   ├── tool_call.py          # Tool-call parsing, validation, schema generation
 │   └── config.py             # AgentConfig (model path, max iterations, etc.)
 ```
 
-### 5.2 Core Abstractions
+### 5.2 Data Flow
 
-#### ModelProvider (Protocol)
-```python
-class ModelProvider(Protocol):
-    def complete(self, request: ModelRequest) -> ModelResponse: ...
-    def is_available(self) -> bool: ...
-    def metadata(self) -> ModelMetadata: ...
+```
+User message
+    ↓
+AgentLoop.run(user_message)
+    ↓
+Session: append user message
+    ↓
+Loop (max_iterations):
+    ↓
+    ModelRequest(messages, tools)
+        ↓
+    ModelProvider.complete(request)
+        ↓
+    ModelResponse
+        ├── text? → return to user (done)
+        └── tool_calls? → for each:
+            ↓
+            Tool-call parser (extract structured call)
+                ↓
+            Schema validation (arguments match tool schema)
+                ↓
+            Gate.handle_agent_tool_call(server_id, tool_id, args, request_id)
+                ↓
+                Catalog lookup → ToolSpec
+                    ↓
+                Scope validation
+                    ↓
+                PolicyEngine.evaluate(role, command, capability, resource)
+                    ↓
+                Decision?
+                    ├── denied → error to model
+                    ├── needs_approval → pause, wait for user
+                    └── allowed →
+                        ↓
+                    McpClient.call(server_id, tool_id, args)
+                        ↓
+                    AuditLog.append(source="agent", ...)
+                        ↓
+                    McpResult
+                ↓
+            Sanitize result (strip secrets)
+                ↓
+            Session: append tool result
+                ↓
+    Back to model (next iteration)
 ```
 
-#### ModelRequest
-```python
-@dataclass
-class ModelRequest:
-    messages: list[dict]           # conversation history
-    tools: list[ToolDefinition]    # available tool schemas
-    max_tokens: int = 1024
-    temperature: float = 0.3
-    stop: list[str] | None = None
-```
+### 5.3 Gate Integration — No Parallel Authorization
 
-#### ModelResponse
-```python
-@dataclass
-class ModelResponse:
-    content: str | None            # text response (if any)
-    tool_calls: list[ToolCall]     # tool calls (if any)
-    finish_reason: str             # "stop", "tool_call", "max_tokens"
-    usage: TokenUsage | None = None
-    raw: dict | None = None        # provider-specific raw output
-```
-
-#### ToolCall
-```python
-@dataclass
-class ToolCall:
-    id: str                        # unique call ID
-    server_id: str                 # MCP server
-    tool_id: str                   # tool name
-    arguments: dict                # parsed arguments
-```
-
-#### ToolDefinition
-```python
-@dataclass
-class ToolDefinition:
-    server_id: str
-    tool_id: str
-    name: str                      # display name for model
-    description: str               # what the tool does
-    parameters: dict               # JSON Schema for arguments
-    capability: str                # required capability
-```
-
-### 5.3 Session / Trajectory
+The agent loop does NOT bypass Gate. A new internal method on Gate:
 
 ```python
-class Session:
-    session_id: str
-    messages: list[dict]           # message history
-    tool_calls: list[ToolCall]     # all tool calls made
-    tool_results: list[McpResult]  # all tool results
-    metadata: dict                 # session metadata (no secrets!)
-
-class Trajectory:
-    """Append-only log of agent actions. Read-only view of session."""
-    entries: list[TrajectoryEntry] # ordered list of actions
-```
-
-**Security rule**: No credentials, no API keys, no secrets in session or trajectory.
-
-### 5.4 Agent Loop
-
-```python
-class AgentLoop:
-    def __init__(
-        self,
-        *,
-        provider: ModelProvider,
-        gate: Gate,                # F2 Gate for policy + MCP
-        session: Session,
-        max_iterations: int = 10,
-        timeout_seconds: float = 120.0,
-    ): ...
-
-    def run(self, user_message: str) -> AgentResult:
-        """Run agent loop: user → model → tool calls → gate → results → model → ..."""
-        # 1. Add user message to session
-        # 2. Loop (max_iterations):
-        #    a. Build ModelRequest from session messages + available tools
-        #    b. provider.complete(request) → ModelResponse
-        #    c. If finish_reason == "stop" → return text response
-        #    d. If finish_reason == "tool_call":
-        #       - Parse tool calls
-        #       - For each tool call:
-        #         i.   Validate schema
-        #         ii.  Build McpRequest
-        #         iii. gate.handle_agent_tool_call(principal, mcp_request)
-        #         iv.  Audit the tool call
-        #         v.   Append result to session
-        #    e. If timeout or max iterations → return error
-        # 3. Return final response
-```
-
-### 5.5 Tool-Call Pipeline
-
-```
-Model Output (text)
-    ↓
-Tool-Call Parser (extract JSON tool calls from model output)
-    ↓
-Schema Validation (validate arguments match tool schema)
-    ↓
-Capability Validation (tool exists in CATALOG, capability known)
-    ↓
-Policy Gate (policy.evaluate → Decision)
-    ↓
-Approval Gate (if needs_approval → pause, wait for approval)
-    ↓
-MCP Client (mcp_client.call → McpResult)
-    ↓
-Result Sanitization (strip secrets from result before feeding to model)
-    ↓
-Session (append tool result to trajectory)
-    ↓
-Model (next inference call with tool result in context)
-```
-
-### 5.6 Integration with Existing Gate
-
-The agent loop does NOT bypass Gate. It uses Gate as the authority:
-
-```python
-# In Gate (core.py) — new method:
 def handle_agent_tool_call(
     self,
+    *,
     principal: Principal,
     server_id: str,
     tool_id: str,
     args: dict,
     request_id: str,
 ) -> McpResult:
-    """Internal tool-call entry point for agent loop.
+    """Internal tool-call entry for agent loop.
     
-    Pipeline: catalog lookup → scope validate → policy → approval → MCP → audit.
-    Same as handle_mcp but without HTTP schema validation.
+    Same pipeline as handle_mcp, without HTTP schema validation.
+    Agent loop already validated the request structure.
     """
+    # 1. Catalog lookup
     spec = tool_lookup(server_id, tool_id)
     if spec is None:
         raise ValidationError(f"unknown tool: {server_id}.{tool_id}")
 
+    # 2. Scope validation
     resource = self._mcp_validate_scope_for_agent(server_id, tool_id, args, spec)
 
+    # 3. Policy evaluation — uses tool's capability, NOT agent capability
     decision = self.policy.evaluate(
         role=principal.role,
         command=spec.command_id,
-        capability=spec.capability,
+        capability=spec.capability,  # <-- tool's capability from CATALOG
         resource=resource,
     )
 
+    # 4. Deny → audit + return error
     if not decision.allowed:
         self._audit_mcp_agent(server_id, tool_id, args, decision, "denied", spec)
         return McpResult(status="error", error_class="denied",
                          data={"error": f"policy denied: {decision.reason}"})
 
+    # 5. Approval required → return approval signal
     if decision.needs_approval:
-        # Agent loop handles approval flow
         return McpResult(status="error", error_class="approval_required",
-                         data={"error": "approval required",
-                               "request_id": request_id})
+                         data={"approval_required": True,
+                               "request_id": request_id,
+                               "command": spec.command_id})
 
+    # 6. Execute via MCP
     try:
         result = self.mcp_client.call(server_id, tool_id, args)
     except Exception as e:
@@ -381,96 +296,343 @@ def handle_agent_tool_call(
         return McpResult(status="error", error_class="mcp_error",
                          data={"error": str(e)})
 
+    # 7. Audit success
     self._audit_mcp_agent(server_id, tool_id, args, decision, "executed", spec,
                           result_status=result.status)
     return result
 ```
 
----
-
-## 6. Files To Create/Modify
-
-### New Files (F7)
-| File | Purpose | Est. Lines |
-|------|---------|------------|
-| `gate/agent/__init__.py` | Package init | ~5 |
-| `gate/agent/provider.py` | ModelProvider protocol, ModelRequest, ModelResponse, ToolCall, ToolDefinition, ModelMetadata, TokenUsage | ~120 |
-| `gate/agent/providers/__init__.py` | Package init | ~5 |
-| `gate/agent/providers/fake.py` | FakeModelProvider for testing | ~80 |
-| `gate/agent/providers/local.py` | LocalModelProvider (llama-cpp wrapper) | ~150 |
-| `gate/agent/session.py` | Session, Trajectory, TrajectoryEntry | ~100 |
-| `gate/agent/loop.py` | AgentLoop — multi-turn inference | ~200 |
-| `gate/agent/tool_call.py` | Tool-call parsing, validation, schema generation from CATALOG | ~100 |
-| `gate/agent/config.py` | AgentConfig | ~40 |
-| `gate/tests/test_f7_agent.py` | Tests for F7 | ~400 |
-
-### Modified Files (F7)
-| File | Change |
-|------|--------|
-| `gate/policy/classes.py` | Add `AGENT = "AGENT"` to Capability enum |
-| `gate/core.py` | Add `handle_agent_tool_call()` method |
-| `gate/config.py` | Add agent config fields (model_path, max_iterations, etc.) |
-| `gate/factory.py` | Wire agent provider into Gate construction |
-| `gate/ingress/schemas.py` | Add "agent" to `_SOURCES` |
-
-### NOT Modified
-| File | Reason |
-|------|--------|
-| `gate/cloud/*` | Cloud execution remains independent |
-| `gate/mcp/*` | MCP boundary unchanged |
-| `gate/audit/*` | Audit mechanism unchanged |
-| `gate/approval/*` | Approval mechanism unchanged |
-| `gate/heartbeat/*` | Heartbeat unchanged |
+**Critical**: `capability=spec.capability` — the capability comes from the ToolSpec in CATALOG, NOT from the agent. The agent is never the source of authority.
 
 ---
 
-## 7. Test Strategy
+## 6. ModelProvider Design
 
-### 7.1 Unit Tests (test_f7_agent.py)
-- ModelProvider protocol compliance
-- FakeModelProvider: deterministic responses
-- ModelRequest/ModelResponse serialization
-- Tool-call parsing (valid, malformed, missing args)
-- Tool-call schema validation
-- Session: message append, trajectory recording
-- Trajectory: append-only, no secrets
-- AgentLoop: single-turn (text response), multi-turn (tool calls), max iterations, timeout
+### 6.1 Protocol
 
-### 7.2 Integration Tests
-- Agent tool call → Gate → Policy → MCP → result
-- Agent tool call denied by policy
-- Agent write → approval required
-- Agent tool call with invalid arguments
-- Agent tool call to unknown tool
-- Agent loop: provider failure recovery
-- Agent loop: cancellation
-- Agent loop: audit entries created
+```python
+class ModelProvider(Protocol):
+    """Model provider interface. Transport-agnostic."""
 
-### 7.3 Security Regression Tests
-- Model cannot bypass policy (test all deny scenarios)
-- Model cannot access vault without rules
-- Model cannot execute shell commands
-- Model cannot write without approval
-- Credentials never appear in session/trajectory
-- Tool results sanitized before feeding to model
-- Agent loop max iterations enforced
-- Agent loop timeout enforced
-- No privilege escalation beyond admin interactive
-- Audit chain integrity after agent operations
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Run inference. Returns structured response."""
+        ...
 
-### 7.4 Existing Test Regression
-- All 304 existing tests must pass unchanged
-- F7 adds tests, does not modify existing test behavior
+    def is_available(self) -> bool:
+        """Check if provider is ready."""
+        ...
+
+    def metadata(self) -> ModelMetadata:
+        """Provider and model metadata."""
+        ...
+```
+
+### 6.2 ModelMetadata
+
+```python
+@dataclass(frozen=True)
+class ModelMetadata:
+    provider_id: str           # "local-llama", "cloud-openai", etc.
+    model_id: str              # "cactus-needle-0.3b", "gpt-4o", etc.
+    display_name: str = ""
+    context_window: int = 4096
+    max_output_tokens: int = 1024
+    supports_tools: bool = True
+    supports_streaming: bool = False
+    ram_mb: int = 0            # local model RAM usage
+    latency_ms_p50: float = 0  # typical inference latency
+```
+
+### 6.3 Provider Selection
+
+```python
+class ProviderRegistry:
+    """Registry of available model providers. Similar to F5 cloud registry."""
+
+    def __init__(self):
+        self._providers: dict[str, ModelProvider] = {}
+
+    def register(self, provider_id: str, provider: ModelProvider) -> None: ...
+    def get(self, provider_id: str) -> ModelProvider: ...
+    def list_available(self) -> list[ModelMetadata]: ...
+    def select_best(self, *, requires_tools: bool = True) -> ModelProvider | None:
+        """Select best available provider. No AI decision — deterministic."""
+        ...
+```
 
 ---
 
-## 8. Security Boundary Analysis
+## 7. ModelRequest/ModelResponse Design
+
+### 7.1 ModelRequest
+
+```python
+@dataclass
+class ModelRequest:
+    messages: list[dict]           # conversation history [{role, content}]
+    tools: list[ToolDefinition]    # available tool schemas
+    max_tokens: int = 1024
+    temperature: float = 0.3       # low temp for deterministic tool calls
+    stop: list[str] | None = None
+    request_id: str = ""           # for audit tracing
+```
+
+### 7.2 ModelResponse
+
+```python
+@dataclass
+class ModelResponse:
+    content: str | None            # text response (if any)
+    tool_calls: list[ToolCall]     # tool calls requested (if any)
+    finish_reason: str             # "stop", "tool_call", "max_tokens", "error"
+    usage: TokenUsage | None = None
+    raw: dict | None = None        # provider-specific raw output (not exposed)
+
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+```
+
+### 7.3 ToolCall
+
+```python
+@dataclass
+class ToolCall:
+    id: str                        # unique call ID (for result matching)
+    server_id: str                 # MCP server (e.g. "filesystem")
+    tool_id: str                   # tool name (e.g. "read_file")
+    arguments: dict                # parsed arguments
+```
+
+### 7.4 ToolDefinition (exposed to model)
+
+```python
+@dataclass
+class ToolDefinition:
+    server_id: str
+    tool_id: str
+    name: str                      # display name for model prompt
+    description: str               # what the tool does
+    parameters: dict               # JSON Schema for arguments
+    # NOTE: capability is NOT exposed to model — model doesn't need to know
+```
+
+---
+
+## 8. Session/Trajectory Design
+
+### 8.1 Session
+
+```python
+class Session:
+    """Mutable session state. Holds conversation and tool call history."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.messages: list[dict] = []        # [{role, content}]
+        self.tool_calls: list[ToolCall] = []  # all tool calls made
+        self.tool_results: list[dict] = []    # [{tool_call_id, result}]
+        self.metadata: dict = {}              # session metadata (NO SECRETS)
+
+    def add_user_message(self, content: str) -> None: ...
+    def add_assistant_message(self, content: str) -> None: ...
+    def add_tool_call(self, call: ToolCall) -> None: ...
+    def add_tool_result(self, tool_call_id: str, result: dict) -> None: ...
+    def to_messages(self) -> list[dict]:
+        """Build message list for ModelRequest."""
+        ...
+```
+
+### 8.2 Trajectory
+
+```python
+@dataclass
+class TrajectoryEntry:
+    timestamp: float
+    event_type: str              # "user_message", "model_response", "tool_call", "tool_result"
+    data: dict                   # event data
+    request_id: str = ""         # audit correlation
+
+class Trajectory:
+    """Append-only log of agent actions. Read-only view."""
+
+    def __init__(self, session: Session):
+        self._session = session
+        self._entries: list[TrajectoryEntry] = []
+
+    def append(self, entry: TrajectoryEntry) -> None: ...
+    def entries(self) -> list[TrajectoryEntry]: ...
+    def to_audit_dict(self) -> dict:
+        """Export for audit logging. Sanitized — no secrets."""
+        ...
+```
+
+### 8.3 Secret Safety
+
+**NEVER stored in session/trajectory:**
+- API keys
+- Vault credentials
+- Raw secrets
+- Authentication tokens
+- Password material
+
+**Tool results sanitized before storing:**
+- Vault read results → content redacted (only secret_id recorded, not value)
+- File read results → no credential patterns
+- Error messages → no credential leakage
+
+**Audit integration:**
+- Trajectory does NOT replace audit log
+- Each tool call creates an audit entry via existing `AuditLog.append()`
+- Trajectory is for model context; audit is for security record
+
+---
+
+## 9. Tool-Call Design
+
+### 9.1 Parsing
+
+Model output is parsed into structured tool calls:
+
+```python
+def parse_tool_calls(response: ModelResponse) -> list[ToolCall]:
+    """Parse model output into ToolCall objects.
+
+    Handles:
+    - JSON function calling format (OpenAI-style)
+    - XML-style tool calls
+    - Plain text with tool call markers
+    Returns empty list if no tool calls found.
+    """
+    ...
+```
+
+### 9.2 Validation Pipeline
+
+```
+Raw model output
+    ↓
+parse_tool_calls() → list[ToolCall]
+    ↓
+For each ToolCall:
+    ↓
+    1. Schema validation (arguments match JSON Schema)
+       → reject if invalid
+    ↓
+    2. Catalog lookup (tool exists in CATALOG?)
+       → reject if unknown tool
+    ↓
+    3. ToolSpec extracted (capability, scope_kind from CATALOG)
+       → capability comes from ToolSpec, NOT from model
+    ↓
+    4. Gate.handle_agent_tool_call(server_id, tool_id, args)
+       → policy.evaluate(role, command, ToolSpec.capability, resource)
+       → Decision
+    ↓
+    5. If denied → return error to model
+    ↓
+    6. If needs_approval → return approval signal to agent loop
+    ↓
+    7. If allowed → McpClient.call() → McpResult
+    ↓
+    8. Sanitize McpResult (strip secrets)
+    ↓
+    9. Append to session
+    ↓
+    10. Audit entry (source="agent", capability=ToolSpec.capability)
+```
+
+### 9.3 Tool Schema Generation
+
+Build tool definitions from CATALOG for the model:
+
+```python
+def build_tool_definitions(
+    catalog: dict,
+    *,
+    include_capabilities: frozenset[str] | None = None,
+    exclude_servers: frozenset[str] | None = None,
+) -> list[ToolDefinition]:
+    """Build tool schemas for model from MCP catalog.
+
+    Args:
+        include_capabilities: if set, only include tools with these capabilities
+        exclude_servers: if set, exclude tools from these servers
+
+    Returns list of ToolDefinition for ModelRequest.tools.
+    """
+    ...
+```
+
+**Tool visibility ≠ permission.** Even if a tool schema is shown to the model, F2 policy decides whether the model can use it. The model may see `vault.write_secret` in its tool list but F2 will deny it (no agent policy rules for vault writes).
+
+---
+
+## 10. Tool-Schema Exposure Design
+
+### What Tools to Show the Model
+
+The model receives tool definitions from CATALOG, filtered by:
+
+- **Include**: Tools with capabilities the agent is expected to use (READ, EXECUTE for common tasks)
+- **Exclude**: Tools the agent should never request (SECRET capability, specific vault operations)
+
+### Filtering Strategy
+
+```python
+# Default agent tool visibility
+AGENT_TOOL_FILTER = {
+    "include_capabilities": {Capability.READ.value, Capability.EXECUTE.value},
+    "exclude_servers": set(),  # no servers excluded by default
+}
+```
+
+### Why Show Tools That Will Be Denied?
+
+Showing `vault.write_secret` to the model but having F2 deny it is **correct behavior**:
+1. Model learns what tools exist (better context)
+2. F2 still enforces policy (model can't bypass)
+3. If model tries → denied → audit logged → model learns to not try again
+4. This is the same pattern as a human user seeing a tool but not having permission
+
+### Capability is NOT Exposed
+
+ToolDefinition does NOT include the capability field. The model doesn't know that `filesystem.read_file` has capability="READ". It only sees:
+- Tool name
+- Description
+- Parameter schema
+
+This prevents the model from reasoning about capabilities (which is a security concern).
+
+---
+
+## 11. Security Boundary Analysis
+
+### Trust Model
+
+```
+UNTRUSTED: Model Output
+    ↓ validation
+STRUCTURED: Tool Call (parsed, schema-validated)
+    ↓ catalog lookup
+IDENTIFIED: ToolSpec (capability from CATALOG, not model)
+    ↓ policy
+AUTHORIZED: Decision (F2 is authority)
+    ↓ approval (if needed)
+APPROVED: User Confirmation
+    ↓ MCP
+EXECUTED: Tool Result
+    ↓ sanitization
+SAFE: Sanitized Result → Model
+```
 
 ### What Model CAN Do
-- Select a tool from available tools (CATALOG)
+- Select a tool from visible tools
 - Generate arguments for the selected tool
 - Request tool execution via structured output
 - Receive tool results in context
+- Retry with different arguments after failure
 
 ### What Model CANNOT Do
 - Bypass policy engine (F2 is authority)
@@ -483,36 +645,119 @@ def handle_agent_tool_call(
 - Control execution priority or privilege
 - Create infinite loops (max_iterations enforced)
 - Escape audit logging
-
-### Trust Boundary
-```
-UNTRUSTED (Model Output)
-    ↓ validation
-TRUSTED (Structured Tool Call)
-    ↓ policy
-AUTHORIZED (Policy Decision)
-    ↓ approval (if needed)
-APPROVED (User Confirmation)
-    ↓ MCP
-EXECUTED (Tool Result)
-    ↓ sanitization
-SAFE (Sanitized Result → Model)
-```
+- Gain authority from being "the agent"
 
 ### Threat Model
-1. **Model hallucinates tool call** → Schema validation rejects
-2. **Model generates invalid JSON** → Parser rejects, loop continues
-3. **Model requests unauthorized tool** → Policy denies
-4. **Model requests write without approval** → Approval gate blocks
-5. **Model tries to access vault/credentials** → Policy denies (no vault rules for agent)
-6. **Model generates infinite tool calls** → max_iterations stops loop
-7. **Model output contains prompt injection** → Tool results sanitized before model sees them
-8. **Provider fails** → Loop handles error, returns to user
-9. **Tool execution fails** → Error captured, loop continues or terminates
+
+| Threat | Mitigation |
+|--------|-----------|
+| Model hallucinates tool call | Schema validation rejects malformed calls |
+| Model generates invalid JSON | Parser returns empty list, loop continues |
+| Model requests unauthorized tool | F2 policy denies, audit logged |
+| Model requests write without approval | Approval gate blocks, user confirms |
+| Model tries to access vault/credentials | F2 policy denies (no agent vault rules) |
+| Model generates infinite tool calls | max_iterations stops loop |
+| Model output contains injection | Tool results sanitized before model sees them |
+| Provider fails | Loop handles error, returns to user |
+| Tool execution fails | Error captured, loop continues or terminates |
+| Model tries to escalate via identity | Agent role = admin same as interactive, no extra privilege |
+| Model tries to use agent source for privilege | Source="agent" is audit-only, policy uses tool capability |
 
 ---
 
-## 9. Tiny Model Evaluation / Benchmark Plan
+## 12. Source/Context vs Capability Analysis
+
+### F6 Precedent
+
+F6 established:
+- `source = "background"` → audit context, NOT a capability grant
+- `capability = BACKGROUND` → policy evaluates this
+- `role = "admin"` → who is requesting
+- Policy: admin + BACKGROUND on specific tasks = allowed; user = denied
+
+### F7 Application
+
+F7 follows the same pattern:
+- `source = "agent"` → audit context, NOT a capability grant
+- `capability = ToolSpec.capability` → policy evaluates the TOOL's capability (e.g. READ, WRITE)
+- `role = "admin"` → same role as interactive SSH user
+- Policy: admin + READ on filesystem = allowed; admin + WRITE on vault = denied (no rule)
+
+### Why Agent ≠ Capability
+
+A capability answers: "WHAT authorization is needed?"
+
+- READ → need permission to read
+- WRITE → need permission to write
+- EXECUTE → need permission to execute
+- NETWORK → need permission for network access
+- SECRET → need permission for secret access
+- BACKGROUND → need permission for background execution
+
+"AGENT" does not answer "what authorization is needed." It answers "who initiated this." That's a source/context, not a capability.
+
+If we made AGENT a capability, we would need policy rules like:
+```
+Rule("admin", "AGENT", "filesystem.read_file", allow=True)
+```
+
+But this duplicates the existing rule:
+```
+Rule("admin", "READ", "filesystem.read_file", allow=True)
+```
+
+The tool already has a capability. Adding AGENT as an additional capability layer creates confusion about which one governs authorization.
+
+### Decision: No AGENT Capability
+
+AGENT is a **source** (like "background"), not a **capability**. The tool's own capability from CATALOG is what policy evaluates.
+
+---
+
+## 13. Explicit Decision: AGENT Capability
+
+### Analysis
+
+| Option | Pros | Cons |
+|--------|------|------|
+| AGENT as capability | Explicit marker for agent calls | Duplicates existing tool capabilities; creates confusion about which capability governs |
+| AGENT as source | Clean separation (source=who, capability=what); follows F6 pattern | None — this is the correct pattern |
+| Both AGENT source + capability | Maximum traceability | Redundant; capability layer adds no security value |
+
+### Decision
+
+**AGENT is a source, NOT a capability.**
+
+- `source = "agent"` in audit entries (like `source = "background"`)
+- `capability = ToolSpec.capability` for policy evaluation (tool's own capability)
+- `role = "admin"` for policy identity (same as interactive user)
+
+### Proof of No Privilege Escalation
+
+1. Agent tool calls go through `policy.evaluate(role, command, capability, resource)`
+2. `role = "admin"` — same as interactive SSH user
+3. `capability` = tool's capability from CATALOG (e.g. "READ" for filesystem.read_file)
+4. Policy rules are the same rules that govern interactive commands
+5. Agent gets EXACTLY the same permissions as an interactive admin user
+6. No rule grants extra permission based on source="agent"
+7. If agent tries vault.write → denied (no admin+WRITE+vault rule for agent source, and even if there were, it would require approval)
+
+### Capability Enum Unchanged
+
+```python
+class Capability(str, Enum):
+    READ = "READ"
+    WRITE = "WRITE"
+    EXECUTE = "EXECUTE"
+    SECRET = "SECRET"
+    NETWORK = "NETWORK"
+    BACKGROUND = "BACKGROUND"
+    # NO AGENT — not needed
+```
+
+---
+
+## 14. Tiny-Model Evaluation Plan
 
 ### Candidate Models
 - **Cactus Needle** (if available) — ultra-small, tool-calling focused
@@ -522,6 +767,7 @@ SAFE (Sanitized Result → Model)
 - **Gemma-2-2B** — Google small model
 
 ### Evaluation Criteria
+
 | Criterion | Weight | Measurement |
 |-----------|--------|-------------|
 | Correct tool selection | 20% | % of test cases where model selects the right tool |
@@ -536,81 +782,265 @@ SAFE (Sanitized Result → Model)
 | Memory footprint | 5% | < 2GB RAM for inference |
 
 ### Benchmark Setup
-1. **Synthetic test suite**: 50-100 predefined scenarios with expected tool calls
-2. **FakeModelProvider**: Deterministic responses for CI testing
-3. **Real model evaluation**: Run against actual tiny model on vox-space
-4. **Comparison baseline**: FakeModelProvider with perfect responses = 100% pass rate
 
-### Daemon Architecture (F7-P6)
-If model proves suitable:
+1. **FakeModelProvider**: Deterministic responses for CI (100% pass rate baseline)
+2. **Synthetic test suite**: 50-100 predefined scenarios with expected tool calls
+3. **Real model evaluation**: Run against actual tiny model on vox-space
+4. **Comparison**: FakeModelProvider = 100%, real model measured against that
+
+---
+
+## 15. Daemon Architecture Proposal
+
+### When to Daemonize
+
+Only after:
+1. Model evaluation proves suitable (benchmark > 80% tool selection accuracy)
+2. Provider abstraction is stable (F7-P1 through F7-P4 complete)
+3. Latency/throughput requirements justify persistent process
+
+### Daemon Design
+
 ```
-uta-local-intel.service (systemd oneshot or simple)
+uta-local-intel.service (systemd simple, not oneshot)
 ├── Model lifecycle (load, unload, reload)
-├── Request queue (inference requests)
+├── Request queue (inference requests via Unix socket)
 ├── Inference engine (llama-cpp-python or ONNX runtime)
-├── Health check endpoint
+├── Health check endpoint (localhost only)
 └── IPC via Unix socket or HTTP localhost
 ```
 
-Daemon constraints:
-- Runs as dedicated user (not root)
-- No filesystem access outside model dir
-- No network access (except localhost for IPC)
-- No vault access
-- No credential access
-- Resource limits: MemoryMax, CPUQuota
+### Daemon Constraints
+
+| Resource | Constraint |
+|----------|-----------|
+| User | Dedicated `uta-intel` user, NOT root |
+| Filesystem | Read-only except model dir and /tmp |
+| Network | Localhost only (Unix socket preferred) |
+| Vault | No access |
+| Credentials | No access |
+| Shell | No access |
+| Docker | No access |
+| systemd | MemoryMax=2G, CPUQuota=80% |
+
+### Daemon is NOT a Security Authority
+
+The daemon provides inference. It does NOT:
+- Make authorization decisions
+- Access tools directly
+- Bypass Gate policy
+- Hold credentials
+- Control execution
 
 ---
 
-## 10. Recommendations
+## 16. Test Strategy
 
-### Should tiny model/daemon start now?
-**YES, but incrementally.**
+### 16.1 Unit Tests (test_f7_agent.py)
 
-1. **F7-P0 (now)**: Architecture report (this document). No code.
-2. **F7-P1**: ModelProvider abstraction + FakeModelProvider. No real model needed.
-3. **F7-P2**: Session/Trajectory. State management.
-4. **F7-P3**: AgentLoop + tool-call pipeline with FakeModelProvider.
-5. **F7-P4**: LocalModelProvider with actual tiny model. Benchmark.
-6. **F7-P5**: Daemon separation if model proves suitable.
-7. **F7-P6**: Integration with external clients (Telegram bot, etc.)
+- ModelProvider protocol compliance
+- FakeModelProvider: deterministic responses
+- ModelRequest/ModelResponse serialization
+- Tool-call parsing (valid JSON, XML, malformed)
+- Tool-call schema validation (valid args, missing required, wrong types)
+- Session: message append, trajectory recording, secret safety
+- Trajectory: append-only, no secrets in export
+- AgentLoop: single-turn (text response), multi-turn (tool calls)
+- AgentLoop: max iterations enforced
+- AgentLoop: timeout enforced
+- AgentLoop: cancellation works
+- AgentLoop: provider failure recovery
+- AgentLoop: malformed tool call handling
+- AgentLoop: unknown tool handling
+- AgentLoop: policy denial handling
 
-**Rationale**: The abstraction layer (F7-P1 through F7-P3) is model-agnostic. We can test the entire agent loop with FakeModelProvider before ever downloading a real model. This de-risks the architecture.
+### 16.2 Integration Tests
 
-### What NOT to do now
-- Do not download/quantize any model yet
-- Do not install llama-cpp-python yet
-- Do not create systemd daemon yet
-- Do not integrate with Telegram bot yet
-- Do not modify existing F2-F6 behavior
+- Agent tool call → Gate → Policy → MCP → result
+- Agent tool call denied by policy
+- Agent write → approval required → approval flow
+- Agent tool call with invalid arguments → schema rejection
+- Agent tool call to unknown tool → catalog rejection
+- Agent loop: provider failure → error recovery
+- Agent loop: cancellation mid-tool-call
+- Agent loop: audit entries created correctly
+- Agent loop: trajectory matches audit
+
+### 16.3 Security Regression Tests
+
+- Model cannot bypass policy (test all deny scenarios)
+- Model cannot access vault without rules
+- Model cannot execute shell commands
+- Model cannot write without approval
+- Credentials never appear in session/trajectory
+- Tool results sanitized before feeding to model
+- Agent loop max iterations enforced
+- Agent loop timeout enforced
+- No privilege escalation beyond admin interactive
+- Audit chain integrity after agent operations
+- Source="agent" in audit entries (not granting extra privilege)
+- Agent role identical to interactive admin role
+
+### 16.4 Existing Test Regression
+
+- All 304 existing tests must pass unchanged
+- F7 adds tests, does not modify existing test behavior
 
 ---
 
-## 11. Summary
+## 17. Files/Modules Expected to Change
 
-### F7-P0 Deliverables
-1. ✅ This architecture report
-2. ✅ Existing integration points (Section 2)
-3. ✅ Reusable abstractions (Section 3)
-4. ✅ Conflicts/gaps (Section 4)
-5. ✅ Proposed architecture (Section 5)
-6. ✅ Files to create/modify (Section 6)
-7. ✅ Test strategy (Section 7)
-8. ✅ Security boundary analysis (Section 8)
-9. ✅ Tiny model benchmark plan (Section 9)
-10. ✅ Recommendations (Section 10)
+### New Files (F7)
 
-### F7-P1 Next Step
-Implement `gate/agent/provider.py`:
-- ModelProvider protocol
-- ModelRequest, ModelResponse, ToolCall, ToolDefinition
-- ModelMetadata, TokenUsage
-- FakeModelProvider for testing
+| File | Purpose | Est. Lines |
+|------|---------|------------|
+| `gate/agent/__init__.py` | Package init | ~5 |
+| `gate/agent/provider.py` | ModelProvider protocol, ModelRequest, ModelResponse, ToolCall, ToolDefinition, ModelMetadata, TokenUsage | ~120 |
+| `gate/agent/providers/__init__.py` | Package init | ~5 |
+| `gate/agent/providers/fake.py` | FakeModelProvider for testing | ~80 |
+| `gate/agent/providers/local.py` | LocalModelProvider (llama-cpp wrapper) | ~150 |
+| `gate/agent/session.py` | Session, Trajectory, TrajectoryEntry | ~100 |
+| `gate/agent/loop.py` | AgentLoop — multi-turn inference | ~200 |
+| `gate/agent/tool_call.py` | Tool-call parsing, validation, schema generation from CATALOG | ~100 |
+| `gate/agent/config.py` | AgentConfig | ~40 |
+| `gate/tests/test_f7_agent.py` | Tests for F7 | ~400 |
 
-No real model, no daemon, no external integration.
+### Modified Files (F7)
+
+| File | Change |
+|------|--------|
+| `gate/ingress/schemas.py` | Add "agent" to `_SOURCES` |
+| `gate/core.py` | Add `handle_agent_tool_call()` method |
+| `gate/config.py` | Add agent config fields (model_path, max_iterations, etc.) |
+| `gate/factory.py` | Wire agent provider into Gate construction |
+| `gate/mcp/catalog.py` | Add `argument_schema` to ToolSpec (JSON Schema per tool) |
+
+### NOT Modified
+
+| File | Reason |
+|------|--------|
+| `gate/policy/classes.py` | No new capability needed |
+| `gate/policy/engine.py` | No new policy rules needed for agent |
+| `gate/cloud/*` | Cloud execution remains independent |
+| `gate/mcp/client.py` | MCP execution boundary unchanged |
+| `gate/mcp/servers/*` | MCP server implementations unchanged |
+| `gate/audit/*` | Audit mechanism unchanged |
+| `gate/approval/*` | Approval mechanism unchanged |
+| `gate/heartbeat/*` | Heartbeat unchanged |
+| `gate/auth/*` | Auth mechanism unchanged |
 
 ---
 
-## F7-P0 = COMPLETE
+## 18. Decision Gate
+
+### A. What Changed from Previous F7-P0
+
+| Area | Previous (Original) | Corrected | Why |
+|------|---------------------|-----------|-----|
+| AGENT capability | Proposed adding `AGENT = "AGENT"` to Capability enum | **Not needed.** Agent is a source, not a capability | F6 shows source/capability distinction; agent uses tool's own capability |
+| Policy rules | Implicit agent-specific rules | No new rules. Agent uses existing MCP tool rules | Agent role=admin gets same permissions as interactive |
+| Tool schema exposure | Included capability in ToolDefinition | Capability NOT exposed to model | Model doesn't need to know authorization details |
+| Gate integration | Agent calls Gate through same handle_mcp | New `handle_agent_tool_call()` — internal method, no HTTP validation | Agent loop is internal, but still goes through policy/approval/audit |
+| Source convention | Not clearly defined | `source = "agent"` (like `source = "background"`) | Follows F6 precedent for audit traceability |
+| Security analysis | General | Detailed threat model with 11 specific threats | User requested thorough security boundary analysis |
+| Daemon constraints | Basic | Detailed resource constraints (user, filesystem, network, vault, shell) | Security hardened before implementation |
+
+### B. Why Each Change Was Necessary
+
+1. **AGENT capability removed**: Creating a new capability by analogy with BACKGROUND would create confusion. BACKGROUND is used because heartbeat tasks are specific named operations. Agent calls use existing tools with existing capabilities. No new capability is needed.
+
+2. **Capability not exposed to model**: If the model knows that `filesystem.read_file` has capability="READ", it could reason about capabilities and try to find bypasses. By hiding capability, the model only knows tool name + description + parameters.
+
+3. **Agent source convention**: Source="agent" provides audit traceability without granting privilege. This follows the exact pattern F6 established with source="background".
+
+4. **handle_agent_tool_call()**: Separates the internal agent path from the external HTTP path. Both go through the same policy/approval/audit, but the internal path skips HTTP schema validation (agent loop already validated).
+
+### C. AGENT Capability Decision
+
+**Not needed.** Agent is a source/context (like "background"), not a capability. Tool calls use the tool's own capability from CATALOG. Policy evaluates (role, command, tool_capability, resource) — agent identity is irrelevant to authorization.
+
+### D. How F7 Identifies Agent-Originated Requests Without Extra Privilege
+
+- `source = "agent"` in audit entries (traceability only)
+- `role = "admin"` for policy evaluation (same as interactive)
+- `capability = ToolSpec.capability` (tool's own capability)
+- No policy rule references source="agent" (no source-specific rules)
+- Agent gets identical permissions to interactive admin user
+
+### E. How Tool Calls Enter F2/F3
+
+1. Agent loop parses model output → `ToolCall(server_id, tool_id, arguments)`
+2. Agent loop calls `Gate.handle_agent_tool_call(principal, server_id, tool_id, args, request_id)`
+3. Gate does catalog lookup → `ToolSpec`
+4. Gate does scope validation
+5. Gate does `policy.evaluate(role, command, ToolSpec.capability, resource)`
+6. If allowed → `McpClient.call()` → `McpResult`
+7. Result sanitized → fed back to model
+8. Audit entry created
+
+### F. How Trajectory Remains Secret-Sensitive
+
+- Session stores messages, tool calls, tool results
+- Tool results sanitized before storage:
+  - Vault content redacted (only secret_id recorded)
+  - No credential patterns in file content
+  - Error messages scrubbed
+- Trajectory export for audit: sanitized view
+- No API keys, no vault credentials, no raw secrets ever enter session
+- Same redaction rules as existing AuditLog
+
+### G. How Tiny Local Models Plug In Without Changing Gate Security
+
+1. `LocalModelProvider` implements `ModelProvider` protocol
+2. Plugs into `AgentLoop` via dependency injection
+3. Gate security pipeline unchanged:
+   - Policy engine same
+   - MCP boundary same
+   - Audit same
+   - Approval same
+4. Model only affects: what tool calls are generated
+5. Gate decides: whether those calls are allowed
+6. Model change = different ToolCall generation, same authorization
+
+### H. Recommended Next Step
+
+**F7-P1: ModelProvider abstraction + FakeModelProvider.**
+
+Rationale:
+- P0 architecture is internally consistent with F6
+- No AGENT capability needed (simplifies implementation)
+- Agent source convention established
+- Gate integration method designed
+- Security boundaries verified
+- FakeModelProvider allows testing entire agent loop without real model
+- No model download/install needed yet
+
+F7-P1 deliverables:
+1. `gate/agent/provider.py` — ModelProvider protocol, ModelRequest, ModelResponse, ToolCall, ToolDefinition
+2. `gate/agent/providers/fake.py` — FakeModelProvider with deterministic responses
+3. `gate/agent/tool_call.py` — tool-call parsing + schema validation
+4. `gate/tests/test_f7_agent.py` — unit tests for provider + tool-call parsing
+5. Add "agent" to `_SOURCES` in ingress/schemas.py
+
+---
+
+## Invariant Verification
+
+| Invariant | Status |
+|-----------|--------|
+| deny-by-default preserved | ✅ Agent uses existing MCP rules, no new allow rules |
+| policy enforcement preserved | ✅ policy.evaluate() called for every tool call |
+| approval enforcement preserved | ✅ Write operations still require approval |
+| audit integrity preserved | ✅ source="agent" entries in same audit log |
+| secret isolation preserved | ✅ No secrets in session/trajectory |
+| MCP boundary preserved | ✅ Tool calls go through McpClient |
+| runtime isolation preserved | ✅ No direct filesystem/shell access for model |
+| no shell preserved | ✅ Agent cannot execute shell commands |
+| no arbitrary execution preserved | ✅ Only CATALOG tools callable |
+| no privilege escalation through agent/model identity | ✅ Agent role=admin = interactive admin, no source-based privilege |
+
+---
+
+## F7-P0 CORRECTED = COMPLETE
 
 Awaiting review before proceeding to F7-P1.
