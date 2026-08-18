@@ -1,6 +1,6 @@
 # F7-P0 — Local Intelligence Runtime: Architecture & Preflight Report
 
-> Status: CORRECTED PREFLIGHT / DESIGN
+> Status: COMPLETE / READY FOR F7-P1
 > Date: 2026-08-18
 > Baseline: F6 CONFIRMED CLOSED (304 tests, commit `04dbb59`)
 > Previous: F7-P0 original (superseded by this correction)
@@ -334,9 +334,13 @@ def execute_approved_tool_call(
     if spec is None:
         raise ValidationError(f"unknown tool for command: {approval.command}")
 
-    # Re-validate scope
+    # Verify argument integrity (approved hash matches stored args)
+    if arg_hash(approval.args) != approval.arg_hash:
+        raise ValidationError("approval arg_hash mismatch -- args were tampered")
+
+    # Re-validate scope using original arguments (NOT arg_hash)
     resource = self._mcp_validate_scope_for_agent(
-        spec.server_id, spec.tool_id, approval.arg_hash, spec)
+        spec.server_id, spec.tool_id, approval.args, spec)
 
     # Re-evaluate policy (rules may have changed while agent was suspended)
     decision = self.policy.evaluate(
@@ -1750,23 +1754,38 @@ F7-P1 deliverables:
 
 ---
 
-## Invariant Verification
+## F7-P0 Final Checklist
 
-| Invariant | Status |
-|-----------|--------|
-| deny-by-default preserved | ✅ Agent uses existing MCP rules, no new allow rules |
-| policy enforcement preserved | ✅ policy.evaluate() called for every tool call |
-| approval enforcement preserved | ✅ Write operations still require approval |
-| audit integrity preserved | ✅ source="agent" entries in same audit log |
-| secret isolation preserved | ✅ No secrets in session/trajectory |
-| MCP boundary preserved | ✅ Tool calls go through McpClient |
-| runtime isolation preserved | ✅ No direct filesystem/shell access for model |
-| no shell preserved | ✅ Agent cannot execute shell commands |
-| no arbitrary execution preserved | ✅ Only CATALOG tools callable |
-| | no privilege escalation through agent/model identity | Agent role=principal.role = interactive user, no source-based privilege |
+| # | Invariant | Verified | Evidence |
+|---|-----------|----------|----------|
+| 1 | No Capability.AGENT | Yes | Capability enum: READ, WRITE, EXECUTE, SECRET, NETWORK, BACKGROUND. No AGENT. Section 13. |
+| 2 | source="agent" is provenance/context only | Yes | Section 21. PolicyEngine never receives source. Audit only. |
+| 3 | role comes from invoking Principal | Yes | Section 19. `role=principal.role` in all policy.evaluate() calls. No hardcoded admin. |
+| 4 | capability comes from ToolSpec | Yes | Section 5.3, 20.4. `capability=spec.capability` from CATALOG. |
+| 5 | No hardcoded admin role | Yes | Section 19. All `role="admin"` references are in "wrong" examples or interactive admin context. |
+| 6 | Approval uses existing F2 ApprovalStore | Yes | Section 20.3. ApprovalStore.create(), .approve(), .deny(), .consume(), .get(). No new classes. |
+| 7 | Approval bound to request + command + capability + arg_hash + requester | Yes | Section 20.6. ApprovalStore.consume() verifies all four fields. |
+| 8 | Original arguments preserved for resume | Yes | Section 20.5. AgentLoop.resume() passes approval.args to consume(). args stored in Approval at creation time. |
+| 9 | Argument integrity verified before execution | Yes | Section 5.3. arg_hash(approval.args) == approval.arg_hash checked before scope validation. |
+| 10 | Scope revalidated on resume | Yes | Section 5.3. _mcp_validate_scope_for_agent(spec.server_id, spec.tool_id, approval.args, spec). |
+| 11 | Policy re-evaluated on resume | Yes | Section 5.3. policy.evaluate() called again in execute_approved_tool_call(). |
+| 12 | Expired/denied approvals cannot execute | Yes | Section 20.5. resume() checks approval.state. Section 20.11. consume() rejects non-APPROVED states. |
+| 13 | Resumed execution remains inside Gate | Yes | Section 5.3. execute_approved_tool_call() is a Gate method. McpClient.call() is Gate's boundary. |
+| 14 | MCP remains only tool execution boundary | Yes | Section 5.3. All execution goes through McpClient.call(). No direct model-to-tool path. |
+| 15 | Audit uses existing hash-chain AuditLog | Yes | Section 20.10. All entries go through audit_log.append(). No parallel log. |
+| 16 | Trajectory is secret-safe | Yes | Section 5.2. Sanitize result (strip secrets) before trajectory append. |
+| 17 | F2-F6 security guarantees unchanged | Yes | Section 18. No new capabilities, no new policy rules, no new security boundaries. |
 
 ---
 
-## F7-P0 CORRECTED = COMPLETE
+## F7-P0 -- COMPLETE / READY FOR F7-P1
 
-Awaiting review before proceeding to F7-P1.
+All invariants satisfied. Architecture accepted. No redesign required.
+
+F7-P1 deliverables:
+1. gate/agent/provider.py -- ModelProvider protocol, ModelRequest, ModelResponse, ToolCall, ToolDefinition
+2. gate/agent/providers/fake.py -- FakeModelProvider with deterministic responses
+3. gate/agent/tool_call.py -- tool-call parsing + schema validation
+4. gate/tests/test_f7_agent.py -- unit tests for provider + tool-call parsing
+5. Add "agent" to _SOURCES in ingress/schemas.py
+
