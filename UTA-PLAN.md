@@ -44,7 +44,13 @@
   - Verdict: **LOCAL MODEL USABLE WITH LIMITATIONS**
 - **Test Baseline**: 457 test OK (0 regression).
 
-### F8 — Hardening & Deploy (ACTIVE)
+### F8 — Hardening & Deploy ✅ (COMPLETE / CLOSED)
+- **F8-A COMPLETE**: Configuration management & Subprocess fail-closed fixes.
+- **F8-B COMPLETE**: Production Ingress Authentication (token externalization).
+- **F8-C1 COMPLETE**: OS Hardening (Systemd, vault permissions, audit log migration, logrotate).
+- **F8-C2 COMPLETE**: OS Security (UFW firewall activation, sudo privilege minimization).
+- **F8-D COMPLETE**: Encrypted Backup Pipeline (GPG asymmetric encryption, offline private key custody).
+- **Final Test Baseline**: 463 tests passing, 0 failures, 0 regression.
 
 ## Status Saat Ini
 
@@ -56,7 +62,8 @@
 - F5A (Runtime isolation): **COMPLETE** — 264 test OK
 - F6 (Heartbeat & background): **COMPLETE** — 304 test OK
 - F7 (Local Intelligence Runtime): **COMPLETE** — 457 test OK
-- SYSTEM CHANGES: vault user + /data/vault dir (vox-space)
-- INSTALLATIONS: mcp==2.0.0 (Python 3.14.4 on vox-space)
-- PRODUCTION SERVICES: uta-heartbeat.timer deployed and active (vox-space)
-- F7 CLOSED. Proceeding to F8 — Hardening & Deploy.
+- F8 (Hardening & Deploy): **COMPLETE** — 463 test OK
+- SYSTEM CHANGES: vault user + /data/vault dir, restricted vox sudo, UFW active, encrypted backups.
+- PRODUCTION SERVICES: uta-gate.service (vox:vox), uta-heartbeat.timer deployed and active (vox-space).
+- F8 CLOSED.
+- *Note: No formally authorized F9 currently exists. The planned implementation roadmap (F2–F8) is strictly completed.*
