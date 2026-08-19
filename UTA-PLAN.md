@@ -1,6 +1,6 @@
 # UTA — PROJECT PLAN (FINAL)
 
-> Diperbarui setelah F6. Referensi: `UTA_ARCHITECTURE_FINAL.md`.
+> Diperbarui setelah F7. Referensi: `UTA_ARCHITECTURE_FINAL.md`.
 
 ## Prinsip
 
@@ -34,10 +34,17 @@
 - Commits: `686f8b1`, `d388ff5`. See `F6-REPORT.md`.
 - Deployed: systemd timer active on vox-space, 5-min interval.
 
-### F7 — Local Intelligence Runtime + Tool-Calling Substrate
-- P0 Architecture: COMPLETE. See `F7-P0-ARCHITECTURE.md`.
-- P1 Model Interface: PENDING.
-### F8 — Hardening & Deploy
+### F7 — Local Intelligence Runtime + Tool-Calling Substrate ✅
+- P0 Architecture: **COMPLETE**. See `F7-P0-ARCHITECTURE.md`.
+- P1 Model Interface: **COMPLETE**. See `F7-P1-REPORT.md`.
+- P2 Agent Loop Integration: **COMPLETE**. See `F7-P2-REPORT.md`.
+- P3 Local Runtime: **COMPLETE**. See `F7-P3-REPORT.md`.
+- P4 Capability Benchmark: **COMPLETE**. See `F7-P4-REPORT.md`.
+  - Result: 11 PASS, 1 PARTIAL, 1 FAIL
+  - Verdict: **LOCAL MODEL USABLE WITH LIMITATIONS**
+- **Test Baseline**: 457 test OK (0 regression).
+
+### F8 — Hardening & Deploy (ACTIVE)
 
 ## Status Saat Ini
 
@@ -47,8 +54,9 @@
 - F4 (Vault & secret): **COMPLETE** — 148 test OK
 - F5 (Cloud execution): **COMPLETE** — 209 test OK
 - F5A (Runtime isolation): **COMPLETE** — 264 test OK
-- F6 (Heartbeat & background): **COMPLETE** — **304 test OK**
+- F6 (Heartbeat & background): **COMPLETE** — 304 test OK
+- F7 (Local Intelligence Runtime): **COMPLETE** — 457 test OK
 - SYSTEM CHANGES: vault user + /data/vault dir (vox-space)
 - INSTALLATIONS: mcp==2.0.0 (Python 3.14.4 on vox-space)
 - PRODUCTION SERVICES: uta-heartbeat.timer deployed and active (vox-space)
-- F6 CLOSED. F7-P0 architecture approved, proceeding to F7-P1.
+- F7 CLOSED. Proceeding to F8 — Hardening & Deploy.
