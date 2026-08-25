@@ -120,6 +120,34 @@ Catatan penting:
   ARCHITECTURAL HYPOTHESIS yang harus diuji per-layer
   (lihat UTA-PERSONA-SYSTEM-V2.md §Roadmap).
 
+## 3bis. R1 — PHI-Positioning Test (2026-08-25)
+
+Eksperimen positioning: anchor start vs end vs start+reinforce-end vs
+control; 10 trajektori multi-turn; 1180 calls; 5 repeat. Raw:
+experiments/2026-08-25-r1-phi-positioning/.
+
+Temuan (dengan koreksi adjudikasi manual atas regex classifier):
+
+1. Relokasi penuh anchor ke akhir konteks (kondisi B) MERUGIKAN — gate
+   identitas memburuk (33% menjadi ~72%), dan tanpa system-start model
+   membuka identitas bobotnya langsung: menjawab pertanyaan ChatGPT
+   dengan mengaku sebagai Qwen buatan Alibaba Cloud. Primacy position
+   berfungsi sebagai establishment frame persona.
+2. Reinforcement ringkas di akhir (C, tambahan ~10 prompt token)
+   menekan relapse perilaku pada aliran normal: anti-service tail
+   5/70 menjadi 0/70, forced-question 20/25 menjadi 5/25, latency
+   setara. TAPI corrected identity gate setara baseline (~50% vs 50%):
+   compliance saat diminta eksplisit menjadi CS/assistant TIDAK
+   tertutup oleh positioning (universal di A/B/C).
+3. Struktur efek: primacy = establishment frame; recency = refresh
+   behavior; keduanya tidak saling substitusi.
+
+Status: CURRENT RESEARCH FINDING — partial support untuk hypothesis,
+hanya dalam bentuk C. Detail lengkap + confound + contoh raw:
+RESULTS.md di direktori eksperimen. Constraint untuk R2: reinforcement
+akhir adalah free win; compliance hole adalah target eksak
+challenge-examples.
+
 ## 4. Yang TIDAK diklaim
 
 - Tidak diklaim Qwen2.5-7B "tidak mampu" persona — hanya bahwa jalur
