@@ -23,9 +23,12 @@ direktori ini yang di-import oleh production code (`gate/gate/**`).**
 | [2026-08-25-persona-ablation](2026-08-25-persona-ablation/) | DONE | Ablation 4 kondisi prompt vs Qwen2.5-7B; D_FEWSHOT menang; B_CURRENT gagal anti-service & effort matching |
 | [2026-08-25-live-harness](2026-08-25-live-harness/) | ACTIVE | HTTP harness port 8889, mode frozen/fewshot, untuk live persona test |
 | [2026-08-25-dga](2026-08-25-dga/) | DONE | DGA: H1 PARTIAL, H2 identity gate FAIL (31%), puppetry MEDIUM — retain as research candidate |
+| [2026-08-25-identity-grounding](2026-08-25-identity-grounding/) | DONE | IGE: state block terbaca (peer-reframe) tapi tidak grounding; referent telanjang = kolaps total; gate B borderline |
 | [archive/p0p2-stabilization-baseline.json](archive/p0p2-stabilization-baseline.json) | HISTORICAL | Baseline output era stabilisasi P0/P2 (dipulihkan dari file accidental `gate/-q`) |
 
 ## Berikutnya
 
-- Riset referent grounding (identity state / fine-tuning ringan).
-  DGA membuktikan jalur tambah-rules/tambah-example sudah jenuh.
+- IGE-2: identity state + challenge-examples (resistensi sebagai
+  perilaku yang didemonstrasikan, bukan diinstruksikan).
+- Kandidat jangka panjang: LoRA fine-tuning untuk referent grounding
+  (menyelesaikan masalah di bobot, bukan konteks).
