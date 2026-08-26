@@ -114,3 +114,55 @@ Anchor question terjawab jujur:
 "A3B memberi lebih banyak otak daripada 7B?" — Di hardware kita: TIDAK,
 karena otaknya tidak bisa dimuat. Yang ada saat ini cuma lebih banyak
 parameter di atas kertas (dan di atas anggaran RAM).
+
+---
+
+## ADDENDUM — BRANCH CLOSURE (2026-08-26)
+
+Transcript eksternal benchmark (Ornith-1.5-35B-A3B vs Qwen3.8-27B)
+diterima dan dicatat sebagai **CONTEXTUAL EVIDENCE** — vendor-adjacent,
+BUKAN benchmark internal UTA:
+
+| Observasi eksternal | Klasifikasi |
+|---|---|
+| Raw throughput Ornith tinggi pada hardware yang cocok | contextual [EXT] |
+| Qwen3.8-27B: task correctness lebih tinggi | contextual [EXT] |
+| Qwen3.8-27B: tool calls lebih sedikit, token efficiency lebih baik | contextual [EXT] |
+| Ornith gagal pada sebagian tool-selection/orchestration tasks | contextual [EXT] |
+| Migration task: keduanya sukses, Qwen lebih token-efficient | contextual [EXT] |
+
+### KLASIFIKASI FINAL YANG DIPERTAHANKAN
+
+- A3B: **NOT FEASIBLE ON CURRENT HARDWARE**
+- Capability A3B: **UNKNOWN LOCALLY**
+
+### YANG TIDAK BOLEH DISIMPULKAN DARI EVIDENCE INI
+
+- 'A3B setara dengan 7B' — TIDAK disimpulkan
+- 'A3B kalah dari 7B' — TIDAK disimpulkan
+- Satu-satunya kesimpulan sah: **belum dapat dievaluasi secara lokal
+  karena hardware floor tidak terpenuhi.**
+
+### ARCHITECTURAL POSITION — DITEGASKAN KEMBALI
+
+- 7B = sovereign voice + primary orchestrator (Single Sovereign Voice)
+- 27B = cognitive worker (Lane 1, artifact-only)
+- Agent Runtime = execution workforce (Lane 2)
+- Cognitive Bridge: 7B -> cognitive brief -> 27B -> cognitive artifact
+  -> 7B. Artifact adalah bahan pemikiran, BUKAN authorization.
+- DILARANG SELAMANYA: 27B -> Agent Ticket langsung; 27B bicara langsung
+  ke user; 27B memegang authority apa pun.
+
+### CHECKPOINT STATEMENT
+
+> **'A3B branch closed. External evidence reviewed. Main UTA research
+> remains frozen at R5 Step 2 dataset audit.'**
+
+Frozen state (tidak berubah):
+- R5 LoRA: CONDITIONAL / FROZEN (tag r5-frozen-step2 @ cc3f17d)
+- Dataset: 206 train + 16 holdout + 9 historical failures — DATASET
+  NOT READY (near-dup 53 · holdout ~7% · gt15-word kosong · uncertainty
+  markers minim · soft-flag menunggu review owner)
+
+NEXT: menunggu instruksi owner. Tidak ada eksperimen lanjutan pada
+cabang ini.
